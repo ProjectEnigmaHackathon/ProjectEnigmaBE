@@ -260,6 +260,7 @@ class WorkflowManager:
         self._running_workflows: Dict[str, asyncio.Task] = {}
         self._interrupted_workflows: Dict[str, Dict[str, Any]] = {}
 
+
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def start_workflow(
         self, initial_state: Dict[str, Any], workflow_id: Optional[str] = None
@@ -274,8 +275,12 @@ class WorkflowManager:
         Returns:
             workflow_id: The workflow execution ID
         """
+        print("\n\n[DEBUG] start_workflow called\n")
         if workflow_id is None:
             workflow_id = str(uuid.uuid4())
+            print(f"[DEBUG] Generated new workflow_id: {workflow_id}")
+        else:
+            print(f"[DEBUG] Using provided workflow_id: {workflow_id}")
 
         metadata = WorkflowMetadata(
             workflow_id=workflow_id,
@@ -284,97 +289,88 @@ class WorkflowManager:
             status="running",
             current_step="start",
         )
+        print(f"[DEBUG] Created WorkflowMetadata: {metadata}")
 
         # Update initial state with the workflow ID
         initial_state["workflow_id"] = workflow_id
-        
+        print(f"[DEBUG] Updated initial_state with workflow_id: {initial_state}")
+
         # Store initial state
         self.state_store.store_state(workflow_id, initial_state, metadata)
+        print(f"[DEBUG] Stored initial state in state_store for workflow_id: {workflow_id}")
 
         if self.persistence:
             self.persistence.save_state(workflow_id, initial_state, metadata)
+            print(f"[DEBUG] Persisted initial state for workflow_id: {workflow_id}")
 
         # Start workflow execution
+        print(f"[DEBUG] Creating asyncio task for workflow_id: {workflow_id}")
         task = asyncio.create_task(self._execute_workflow(workflow_id, initial_state))
         self._running_workflows[workflow_id] = task
+        print(f"[DEBUG] Workflow task started and tracked for workflow_id: {workflow_id}")
 
         return workflow_id
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def _execute_workflow(self, workflow_id: str, initial_state: Dict[str, Any]):
         """Execute workflow with error handling and state tracking."""
+        print(f"\n\n[DEBUG] _execute_workflow called for workflow_id: {workflow_id}\n")
         start_time = time.time()
 
         try:
             metadata = self.state_store.get_metadata(workflow_id)
+            print(f"[DEBUG] Retrieved metadata: {metadata}")
             if not metadata:
+                print(f"[ERROR] Workflow metadata not found: {workflow_id}")
                 raise ValueError(f"Workflow metadata not found: {workflow_id}")
 
             # Create configurable dict with thread_id for LangGraph checkpointer
             config = {"configurable": {"thread_id": workflow_id}}
+            print(f"[DEBUG] Created config for workflow: {config}")
 
             # Stream workflow execution with config
             async for event in self.workflow.astream(initial_state, config=config):
+                print(f"[DEBUG] Received event from workflow: {event}")
                 # Handle different event formats from LangGraph
                 if isinstance(event, dict):
-                    # Check for interrupts - LangGraph creates __interrupt__ key
-                    if "__interrupt__" in event:
-                        # Workflow is interrupted, store interrupt data
-                        interrupt_data = event["__interrupt__"]
-                        
-                        # Get the actual state from the most recent non-interrupt event
-                        # or from the workflow's current state
-                        try:
-                            current_state_info = self.workflow.get_state(config)
-                            current_state = current_state_info.values if hasattr(current_state_info, 'values') else event
-                        except:
-                            current_state = event
-                        
-                        self._interrupted_workflows[workflow_id] = {
-                            "interrupt_data": interrupt_data,
-                            "state": current_state,
-                            "timestamp": datetime.now(),
-                        }
-                        
-                        metadata.status = "paused"
-                        metadata.current_step = current_state.get("current_step", "human_approval")
-                        metadata.execution_time = time.time() - start_time
-                        
-                        # Store interrupted state
-                        self.state_store.store_state(workflow_id, current_state, metadata)
-                        
-                        if self.persistence:
-                            self.persistence.save_state(workflow_id, current_state, metadata)
-                        
-                        # Remove from running workflows since it's now paused
-                        self._running_workflows.pop(workflow_id, None)
-                        return
-                    
-                    # Regular state update
-                    current_state = event
+                    # Check if this is a nested state (e.g., {'start': {...}})
+                    if len(event) == 1 and any(key in event for key in ['start', 'jira_collection', 'branch_discovery', 'merge_validation', 'sprint_merging', 'release_creation', 'pr_generation', 'release_tagging', 'rollback_preparation', 'documentation', 'error_handler', 'complete']):
+                        # Extract the actual state from the nested structure
+                        current_state = list(event.values())[0]
+                        print(f"[DEBUG] Extracted nested state: {current_state}")
+                    else:
+                        # Regular state update
+                        current_state = event
                 else:
                     current_state = event
+
+                print(f"[DEBUG] Current state: {current_state}")
 
                 # Update metadata
                 metadata.current_step = current_state.get("current_step", "unknown")
                 metadata.execution_time = time.time() - start_time
+                print(f"[DEBUG] Updated metadata: {metadata}")
 
                 # Store updated state
                 self.state_store.store_state(workflow_id, current_state, metadata)
+                print(f"[DEBUG] Stored updated state for workflow_id: {workflow_id}")
 
                 # Persist periodically
                 if (
                     self.persistence and metadata.execution_time % 30 < 1
                 ):  # Every ~30 seconds
                     self.persistence.save_state(workflow_id, current_state, metadata)
+                    print(f"[DEBUG] Periodically persisted state for workflow_id: {workflow_id}")
 
                 # Check if workflow is complete
                 if current_state.get("workflow_complete", False):
+                    print(f"[DEBUG] Workflow {workflow_id} marked as complete.")
                     metadata.status = "completed"
                     break
 
                 # Check for errors (but not if workflow is paused)
                 if current_state.get("error") and not current_state.get("workflow_paused"):
+                    print(f"[ERROR] Workflow {workflow_id} encountered error: {current_state.get('error')}")
                     metadata.error_count += 1
                     metadata.last_error = current_state["error"]
                     metadata.status = "failed"
@@ -382,18 +378,23 @@ class WorkflowManager:
 
             # Final state save
             final_state = self.state_store.get_state(workflow_id)
+            print(f"[DEBUG] Final state for workflow_id {workflow_id}: {final_state}")
             if final_state and self.persistence:
                 self.persistence.save_state(workflow_id, final_state, metadata)
+                print(f"[DEBUG] Persisted final state for workflow_id: {workflow_id}")
 
         except Exception as e:
+            print(f"[ERROR] Exception in _execute_workflow for workflow_id {workflow_id}: {e}")
             # Handle execution errors
             metadata = self.state_store.get_metadata(workflow_id)
             if metadata:
                 # Check if workflow is paused - don't mark as failed if paused
                 current_state = self.state_store.get_state(workflow_id)
                 if current_state and current_state.get("workflow_paused"):
+                    print(f"[DEBUG] Workflow {workflow_id} is paused after exception.")
                     metadata.status = "paused"
                 else:
+                    print(f"[DEBUG] Marking workflow {workflow_id} as failed due to exception.")
                     metadata.status = "failed"
                     metadata.error_count += 1
                     metadata.last_error = str(e)
@@ -404,45 +405,18 @@ class WorkflowManager:
                     error_state["current_step"] = "error"
 
                     self.state_store.store_state(workflow_id, error_state, metadata)
+                    print(f"[DEBUG] Stored error state for workflow_id: {workflow_id}")
 
                     if self.persistence:
                         self.persistence.save_state(workflow_id, error_state, metadata)
+                        print(f"[DEBUG] Persisted error state for workflow_id: {workflow_id}")
                 
                 metadata.execution_time = time.time() - start_time
 
         finally:
             # Clean up running workflow tracking
             self._running_workflows.pop(workflow_id, None)
-
-    @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
-    async def resume_workflow_with_approval(self, workflow_id: str, approval_decision: Dict[str, Any]) -> bool:
-        """
-        Resume a workflow that was interrupted for human approval.
-
-        Args:
-            workflow_id: The workflow ID to resume
-            approval_decision: The approval decision from the user
-
-        Returns:
-            bool: True if successfully resumed, False otherwise
-        """
-        if workflow_id not in self._interrupted_workflows:
-            return False
-
-        interrupt_info = self._interrupted_workflows[workflow_id]
-        
-        # For LangGraph interrupts, we simply pass the approval decision as the resume value
-        # The interrupt() function in the workflow will receive this value directly
-        resume_command = Command(resume=approval_decision)
-        
-        # Resume workflow execution
-        task = asyncio.create_task(self._resume_workflow(workflow_id, resume_command))
-        self._running_workflows[workflow_id] = task
-        
-        # Remove from interrupted workflows
-        self._interrupted_workflows.pop(workflow_id, None)
-        
-        return True
+            print(f"[DEBUG] Cleaned up running workflow tracking for workflow_id: {workflow_id}")
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def _resume_workflow(self, workflow_id: str, resume_command: Command):
@@ -496,8 +470,13 @@ class WorkflowManager:
                         self._running_workflows.pop(workflow_id, None)
                         return
                     
-                    # Regular state update
-                    current_state = event
+                    # Check if this is a nested state (e.g., {'start': {...}})
+                    if len(event) == 1 and any(key in event for key in ['start', 'jira_collection', 'branch_discovery', 'merge_validation', 'sprint_merging', 'release_creation', 'pr_generation', 'release_tagging', 'rollback_preparation', 'documentation', 'error_handler', 'complete']):
+                        # Extract the actual state from the nested structure
+                        current_state = list(event.values())[0]
+                    else:
+                        # Regular state update
+                        current_state = event
                 else:
                     current_state = event
 
@@ -694,27 +673,7 @@ class WorkflowManager:
 
             await asyncio.sleep(0.5)  # Poll every 500ms
 
-    def get_interrupted_workflows(self) -> List[Dict[str, Any]]:
-        """Get list of workflows that are currently interrupted."""
-        return [
-            {
-                "workflow_id": workflow_id,
-                "interrupt_data": info["interrupt_data"],
-                "timestamp": info["timestamp"].isoformat(),
-                "state": info["state"],
-            }
-            for workflow_id, info in self._interrupted_workflows.items()
-        ]
 
-    def is_workflow_interrupted(self, workflow_id: str) -> bool:
-        """Check if a workflow is currently interrupted."""
-        return workflow_id in self._interrupted_workflows
-
-    def get_interrupt_data(self, workflow_id: str) -> Optional[Dict[str, Any]]:
-        """Get interrupt data for a specific workflow."""
-        if workflow_id in self._interrupted_workflows:
-            return self._interrupted_workflows[workflow_id]["interrupt_data"]
-        return None
 
 
 # Global workflow manager instance

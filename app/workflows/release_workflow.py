@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.types import interrupt
+
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.core.config import get_settings
@@ -196,6 +196,11 @@ def handle_workflow_error(
     state: "WorkflowState", step: str, error: str
 ) -> "WorkflowState":
     """Handle workflow errors with recovery options."""
+    print(f"\n\n[DEBUG] handle_workflow_error called\n")
+    print(f"[DEBUG] step: {step}")
+    print(f"[DEBUG] error: {error}")
+    print(f"[DEBUG] state before error handling: {state}")
+
     state["error"] = error
     state["error_step"] = step
     state["current_step"] = "error"
@@ -204,28 +209,33 @@ def handle_workflow_error(
 
     # Ensure messages key exists
     if "messages" not in state:
+        print("[DEBUG] 'messages' key not found in state, initializing as empty list.")
         state["messages"] = []
 
     error_msg = AIMessage(
         content=f"❌ **Error in {step}:**\n{error}\n\n"
         f"🔄 The workflow can be resumed after resolving the issue.\n\n"
     )
+    print(f"[DEBUG] Adding error message to state['messages']")
     state["messages"] = add_messages(state["messages"], [error_msg])
 
+    print(f"[DEBUG] state after error handling: {state}")
     return state
 
 
 def should_continue_workflow(state: "WorkflowState") -> str:
     """Determine the next step based on workflow state."""
     current_step = state.get("current_step", "")
+    print(f"\n\n[DEBUG] should_continue_workflow called\n")
+    print(f"[DEBUG] current_step: {current_step}")
+    print(f"[DEBUG] state: {state}")
 
     # Define the workflow flow
     step_flow = {
         "start": "jira_collection",
         "jira_collection": "branch_discovery",
         "branch_discovery": "merge_validation",
-        "merge_validation": "human_approval",
-        "human_approval": "sprint_merging",
+        "merge_validation": "sprint_merging",
         "sprint_merging": "release_creation",
         "release_creation": "pr_generation",
         "pr_generation": "release_tagging",
@@ -233,36 +243,51 @@ def should_continue_workflow(state: "WorkflowState") -> str:
         "rollback_preparation": "documentation",
         "documentation": "complete",
         "error": "error_handler",
+        "error_handler": "error_handler",  # Allow error handler to route to itself
     }
+    
+    # Handle empty or missing current_step
+    if not current_step or current_step == "":
+        print("[DEBUG] Current step is empty or missing. Starting from 'start'.")
+        return "start"
     
     # Handle paused workflows - stay at current step
     if state.get("workflow_paused"):
-        return current_step if current_step else "error_handler"
+        print("[DEBUG] Workflow is paused.")
+        result = current_step if current_step else "error_handler"
+        print(f"[DEBUG] Returning: {result}")
+        return result
     
     # Handle error states first
     if state.get("error") and not state.get("can_continue"):
+        print("[DEBUG] Error present and cannot continue. Routing to error_handler.")
         return "error_handler"
 
     # Handle completion
     if state.get("workflow_complete"):
+        print("[DEBUG] Workflow is complete. Routing to 'complete'.")
         return "complete"
 
     # Handle resuming from a specific step
     if current_step and current_step in step_flow:
-        # If we're resuming and the current step is already completed, move to next
         steps_completed = state.get("steps_completed", [])
+        print(f"[DEBUG] steps_completed: {steps_completed}")
         if current_step in steps_completed:
-            return step_flow.get(current_step, "complete")
+            next_step = step_flow.get(current_step, "complete")
+            print(f"[DEBUG] Current step '{current_step}' already completed. Routing to next step: {next_step}")
+            return next_step
         else:
-            # Resume from the current step
+            print(f"[DEBUG] Resuming from current step: {current_step}")
             return current_step
 
     # Handle unknown states
     if current_step not in step_flow:
+        print(f"[DEBUG] Current step '{current_step}' not in step_flow. Routing to error_handler.")
         return "error_handler"
 
-    return step_flow.get(current_step, "complete")
-
+    result = step_flow.get(current_step, "complete")
+    print(f"[DEBUG] Default routing to: {result}")
+    return result
 
 class WorkflowState(TypedDict):
     """Enhanced state object for the release workflow with persistence support."""
@@ -299,11 +324,7 @@ class WorkflowState(TypedDict):
     steps_completed: List[str]
     steps_failed: List[str]
 
-    # Human approval system
-    approval_required: bool
-    approval_message: str
-    approval_id: str
-    approval_decision: Dict[str, Any]
+
 
 
 def create_release_workflow() -> StateGraph:
@@ -312,15 +333,25 @@ def create_release_workflow() -> StateGraph:
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def start_workflow(state: WorkflowState) -> WorkflowState:
         """Initialize the workflow with user input."""
+        print(f"\n\n[DEBUG] start_workflow called\n")
+        print(f"[DEBUG] Initial state: {state}")
+
         try:
             # Check if this is a fresh start or a resume
             is_resume = state.get("workflow_id") and (
                 state.get("steps_completed") or 
-                state.get("current_step") != "start" or
+                # state.get("current_step") != "start" or
                 state.get("workflow_complete") is True
             )
-            
+            print(f"[DEBUG] state: {state}")
+            print(f"[DEBUG] state.get('workflow_id'): {state.get('workflow_id')}")
+            print(f"[DEBUG] state.get('steps_completed'): {state.get('steps_completed')}")
+            print(f"[DEBUG] state.get('current_step'): {state.get('current_step')}")
+            print(f"[DEBUG] state.get('workflow_complete'): {state.get('workflow_complete')}")
+            print(f"[DEBUG] is_resume: {is_resume}")
+
             if not is_resume:
+                print("[DEBUG] Fresh start detected. Initializing state variables.")
                 # Fresh start - initialize all state variables
                 state["current_step"] = "start"
                 state["workflow_complete"] = False
@@ -331,24 +362,25 @@ def create_release_workflow() -> StateGraph:
                 state["can_continue"] = True
                 state["steps_completed"] = []
                 state["steps_failed"] = []
-                state["approval_required"] = False
-                state["approval_message"] = ""
-                state["approval_id"] = ""
-                state["approval_decision"] = {}
 
                 # Generate workflow ID if not present
                 if not state.get("workflow_id"):
                     import uuid
                     state["workflow_id"] = str(uuid.uuid4())
+                    print(f"[DEBUG] Generated new workflow_id: {state['workflow_id']}")
+                else:
+                    print(f"[DEBUG] Using provided workflow_id: {state['workflow_id']}")
 
                 # Add initial message for fresh start
                 ai_msg = AIMessage(content="🚀 Starting release automation workflow...\n\n")
                 state["messages"] = add_messages(state["messages"], [ai_msg])
+                print(f"[DEBUG] Added initial AIMessage to messages.")
 
                 # Extract workflow parameters
                 repositories = state.get("repositories", [])
                 fix_version = state.get("fix_version", "v2.1.0")
                 sprint_name = state.get("sprint_name", "sprint-2024-01")
+                print(f"[DEBUG] Workflow parameters - repositories: {repositories}, fix_version: {fix_version}, sprint_name: {sprint_name}")
 
                 config_msg = AIMessage(
                     content=f"📋 **Release Configuration:**\n"
@@ -358,27 +390,49 @@ def create_release_workflow() -> StateGraph:
                     f"- Target Repositories: {', '.join(repositories)}\n\n"
                 )
                 state["messages"] = add_messages(state["messages"], [config_msg])
+                print(f"[DEBUG] Added config AIMessage to messages.")
 
                 state["steps_completed"].append("start")
+                print(f"[DEBUG] Appended 'start' to steps_completed: {state['steps_completed']}")
             else:
+                print("[DEBUG] Resume detected. Preserving existing state and adding resume message.")
                 # Resume - preserve existing state and add resume message
                 # Ensure messages key exists
                 if "messages" not in state:
                     state["messages"] = []
+                    print("[DEBUG] 'messages' key not found in state. Initialized to empty list.")
                 
                 resume_msg = AIMessage(content="🔄 Resuming release automation workflow...\n\n")
                 state["messages"] = add_messages(state["messages"], [resume_msg])
+                print(f"[DEBUG] Added resume AIMessage to messages.")
                 
                 # Clear any previous errors when resuming
                 state["error"] = ""
                 state["error_step"] = ""
                 state["can_continue"] = True
                 state["workflow_paused"] = False
+                if not state["steps_completed"]:
+                    state["steps_completed"]= ["start"]
+                if state["steps_completed"] and "start" not in state["steps_completed"]:
+                    state["steps_completed"].append("start")
 
+                # Ensure current_step is set properly for resume
+                if not state.get("current_step") or state["current_step"] == "":
+                    # If no current step, start from the beginning
+                    state["current_step"] = "start"
+                    print(f"[DEBUG] No current_step found, setting to 'start'")
+                else:
+                    print(f"[DEBUG] Using existing current_step: {state['current_step']}")
+                
+                print(f"[DEBUG] Cleared error, error_step, set can_continue=True, workflow_paused=False.")
+
+            print(f"[DEBUG] Final state before sleep/return: {state}")
             await asyncio.sleep(0.5)
+            print(f"[DEBUG] Returning state from start_workflow.")
             return state
 
         except Exception as e:
+            print(f"[ERROR] Exception in start_workflow: {e}")
             return handle_workflow_error(state, "start", str(e))
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
@@ -720,79 +774,7 @@ def create_release_workflow() -> StateGraph:
         except Exception as e:
             return handle_workflow_error(state, "merge_validation", str(e))
 
-    @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
-    async def request_human_approval(state: WorkflowState) -> WorkflowState:
-        """Step 4: Request human approval for proceeding using LangGraph interrupt."""
-        try:
-            # Check if this step has already been completed
-            if check_step_completion(state, "human_approval", "Step 4: Human Approval"):
-                return state
 
-            state["current_step"] = "human_approval"
-
-            # Prepare approval message
-            approval_message = (
-                "Please review the merge status and approve proceeding with:\n"
-                f"• Merging {state['sprint_name']} branches to develop\n"
-                "• Creating release branches\n"
-                "• Generating pull requests"
-            )
-
-            approval_msg = AIMessage(
-                content="👤 **Step 4: Human Approval Required**\n"
-                f"{approval_message}\n\n"
-                "⏳ **Waiting for your approval...**\n\n"
-                "⚠️ This workflow will pause here until approval is granted.\n"
-            )
-            state["messages"] = add_messages(state["messages"], [approval_msg])
-            
-            # Set approval status
-            state["approval_required"] = True
-            state["approval_message"] = approval_message
-
-            # Use LangGraph interrupt to pause execution and wait for approval decision
-            approval_decision = interrupt({
-                "prompt": approval_message,
-                "repositories": state.get("repositories", []),
-                "fix_version": state.get("fix_version", ""),
-                "sprint_name": state.get("sprint_name", ""),
-                "workflow_id": state.get("workflow_id", ""),
-                "step": "human_approval",
-                "data": {
-                    "jira_tickets": len(state.get("jira_tickets", [])),
-                    "feature_branches": state.get("feature_branches", {}),
-                    "merge_status": state.get("merge_status", {})
-                }
-            })
-
-            # Process the approval decision received from resume
-            if approval_decision and approval_decision.get("approved", False):
-                state["approval_required"] = False
-                user_id = approval_decision.get('user_id', 'System')
-                approved_msg = AIMessage(
-                    content=f"✅ **Approval received from {user_id}**\n"
-                    f"📝 Notes: {approval_decision.get('notes', 'No notes provided')}\n"
-                    "🚀 Continuing workflow...\n\n"
-                )
-                state["messages"] = add_messages(state["messages"], [approved_msg])
-                state["steps_completed"].append("human_approval")
-                return state
-            else:
-                # Approval was denied or invalid
-                state["approval_required"] = False
-                user_id = approval_decision.get('user_id', 'System') if approval_decision else 'System'
-                denied_msg = AIMessage(
-                    content=f"❌ **Approval denied by {user_id}**\n"
-                    f"📝 Notes: {approval_decision.get('notes', 'No notes provided') if approval_decision else 'No approval decision received'}\n"
-                    "🛑 Workflow cancelled.\n\n"
-                )
-                state["messages"] = add_messages(state["messages"], [denied_msg])
-                state["workflow_complete"] = True
-                state["error"] = "Workflow cancelled by user denial"
-                return state
-
-        except Exception as e:
-            return handle_workflow_error(state, "human_approval", str(e))
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def merge_sprint_branches(state: WorkflowState) -> WorkflowState:
@@ -972,7 +954,7 @@ def create_release_workflow() -> StateGraph:
             if check_step_completion(state, "release_creation", "Step 6: Creating Release Branches"):
                 return state
 
-            state["current_step"] = "release_branch_creation"
+            state["current_step"] = "release_creation"
 
             msg = AIMessage(
                 content=f"\n🌿 **Step 6: Creating Release Branches**\n"
@@ -1090,7 +1072,7 @@ def create_release_workflow() -> StateGraph:
             )
             state["messages"] = add_messages(state["messages"], [summary_msg])
 
-            state["steps_completed"].append("release_branch_creation")
+            state["steps_completed"].append("release_creation")
             return state
 
         except Exception as e:
@@ -1104,7 +1086,7 @@ def create_release_workflow() -> StateGraph:
             if check_step_completion(state, "pr_generation", "Step 7: Generating Pull Requests"):
                 return state
 
-            state["current_step"] = "pull_request_generation"
+            state["current_step"] = "pr_generation"
 
             msg = AIMessage(
                 content=f"\n📝 **Step 7: Generating Pull Requests**\n"
@@ -1220,7 +1202,7 @@ def create_release_workflow() -> StateGraph:
             )
             state["messages"] = add_messages(state["messages"], [summary_msg])
 
-            state["steps_completed"].append("pull_request_generation")
+            state["steps_completed"].append("pr_generation")
             return state
 
         except Exception as e:
@@ -1659,7 +1641,7 @@ def create_release_workflow() -> StateGraph:
             if check_step_completion(state, "documentation", "Step 10: Generating Confluence Documentation"):
                 return state
 
-            state["current_step"] = "documentation_generation"
+            state["current_step"] = "documentation"
 
             msg = AIMessage(
                 content=f"\n📚 **Step 10: Generating Confluence Documentation**\n"
@@ -1740,7 +1722,7 @@ def create_release_workflow() -> StateGraph:
             )
             state["messages"] = add_messages(state["messages"], [doc_msg])
 
-            state["steps_completed"].append("documentation_generation")
+            state["steps_completed"].append("documentation")
             return state
 
         except Exception as e:
@@ -1777,11 +1759,18 @@ def create_release_workflow() -> StateGraph:
             state["can_continue"] = True
             
             # Resume from the failed step instead of continuing to next
-            state["current_step"] = error_step
-
-            recovery_msg = AIMessage(
-                content=f"✅ **Auto-recovery attempt {retry_count + 1}** - resuming from step '{error_step}'...\n\n"
-            )
+            # If error_step is empty or unknown, start from the beginning
+            if not error_step or error_step == "unknown" or error_step == "":
+                state["current_step"] = "start"
+                recovery_msg = AIMessage(
+                    content=f"✅ **Auto-recovery attempt {retry_count + 1}** - starting from beginning...\n\n"
+                )
+            else:
+                state["current_step"] = error_step
+                recovery_msg = AIMessage(
+                    content=f"✅ **Auto-recovery attempt {retry_count + 1}** - resuming from step '{error_step}'...\n\n"
+                )
+            
             state["messages"] = add_messages(state["messages"], [recovery_msg])
         else:
             state["can_continue"] = False
@@ -1835,7 +1824,6 @@ def create_release_workflow() -> StateGraph:
     workflow.add_node("jira_collection", collect_jira_tickets)
     workflow.add_node("branch_discovery", discover_feature_branches)
     workflow.add_node("merge_validation", validate_merge_status)
-    workflow.add_node("human_approval", request_human_approval)
     workflow.add_node("sprint_merging", merge_sprint_branches)
     workflow.add_node("release_creation", create_release_branches)
     workflow.add_node("pr_generation", generate_pull_requests)
@@ -1881,16 +1869,6 @@ def create_release_workflow() -> StateGraph:
 
     workflow.add_conditional_edges(
         "merge_validation",
-        should_continue_workflow,
-        {
-            "human_approval": "human_approval",
-            "error_handler": "error_handler",
-            "complete": "complete",
-        },
-    )
-
-    workflow.add_conditional_edges(
-        "human_approval",
         should_continue_workflow,
         {
             "sprint_merging": "sprint_merging",
@@ -1963,7 +1941,6 @@ def create_release_workflow() -> StateGraph:
             "jira_collection": "jira_collection",
             "branch_discovery": "branch_discovery",
             "merge_validation": "merge_validation",
-            "human_approval": "human_approval",
             "sprint_merging": "sprint_merging",
             "release_creation": "release_creation",
             "pr_generation": "pr_generation",

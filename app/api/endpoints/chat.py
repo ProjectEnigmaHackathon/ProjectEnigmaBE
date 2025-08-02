@@ -20,7 +20,7 @@ from app.models.api import (
     ChatRequest,
     ChatResponse,
     WorkflowStatus,
-    ApprovalRequest,
+
     ErrorResponse,
 )
 from app.workflows.workflow_manager import get_workflow_manager
@@ -160,17 +160,8 @@ async def send_message(request: ChatRequest):
         if not status_info:
             raise HTTPException(status_code=500, detail="Failed to get workflow status")
         
-        # Check if workflow is interrupted (requires human approval)
-        is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
-        interrupt_data = None
-        requires_approval = False
-        
-        if is_interrupted:
-            interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
-            requires_approval = True
-        else:
-            # Also check the state-based approval requirement (for backwards compatibility)
-            requires_approval = status_info["state"].get("approval_required", False)
+
+        # Format response data without interrupt handling
         
         # Format response data
         response_data = {
@@ -180,16 +171,10 @@ async def send_message(request: ChatRequest):
             "messages": format_workflow_messages(status_info["state"].get("messages", [])),
         }
         
-        # Add interrupt data if available
-        if interrupt_data:
-            response_data["interrupt_data"] = interrupt_data
-            response_data["approval_prompt"] = interrupt_data.get("prompt", "Approval required")
+
         
         # Determine appropriate message based on status
-        if is_interrupted:
-            message = "Workflow paused for human approval. Please review and approve to continue."
-            message_type = "approval_required"
-        elif status_info["metadata"]["status"] == "completed":
+        if status_info["metadata"]["status"] == "completed":
             message = "Workflow completed successfully."
             message_type = "workflow_completed"
         elif status_info["metadata"]["status"] == "failed":
@@ -205,7 +190,7 @@ async def send_message(request: ChatRequest):
             message_type=message_type,
             workflow_status=map_workflow_status(status_info["metadata"]["status"]),
             data=response_data,
-            requires_approval=requires_approval,
+            requires_approval=False,
         )
         
         return response
@@ -227,11 +212,11 @@ async def get_workflow_status(workflow_id: str):
         if not status_info:
             raise HTTPException(status_code=404, detail="Workflow not found")
         
-        # Check if workflow is interrupted
-        is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
-        interrupt_data = None
-        if is_interrupted:
-            interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
+        # # Check if workflow is interrupted
+        # is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
+        # interrupt_data = None
+        # if is_interrupted:
+        #     interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
         
         return {
             "workflow_id": workflow_id,
@@ -242,10 +227,8 @@ async def get_workflow_status(workflow_id: str):
             "last_error": status_info["metadata"]["last_error"],
             "messages": format_workflow_messages(status_info["state"].get("messages", [])),
             "is_running": status_info["is_running"],
-            "is_interrupted": is_interrupted,
-            "interrupt_data": interrupt_data,
-            "requires_approval": is_interrupted or status_info["state"].get("approval_required", False),
-            "approval_message": status_info["state"].get("approval_message", ""),
+            "is_interrupted": False,
+            "requires_approval": False,
             "steps_completed": status_info["state"].get("steps_completed", []),
             "steps_failed": status_info["state"].get("steps_failed", []),
         }
@@ -268,10 +251,10 @@ async def stream_workflow_updates(workflow_id: str):
         try:
             async for update in workflow_manager.get_workflow_stream(workflow_id):
                 # Check if workflow is interrupted
-                is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
-                interrupt_data = None
-                if is_interrupted:
-                    interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
+                # is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
+                # interrupt_data = None
+                # if is_interrupted:
+                #     interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
                 
                 # Format the update for SSE
                 sse_data = {
@@ -280,10 +263,8 @@ async def stream_workflow_updates(workflow_id: str):
                     "current_step": update["metadata"]["current_step"],
                     "execution_time": update["metadata"]["execution_time"],
                     "messages": format_workflow_messages(update["state"].get("messages", [])),
-                    "is_interrupted": is_interrupted,
-                    "interrupt_data": interrupt_data,
-                    "requires_approval": is_interrupted or update["state"].get("approval_required", False),
-                    "approval_message": update["state"].get("approval_message", ""),
+                    "is_interrupted": False,
+                    "requires_approval": False,
                     "timestamp": update["timestamp"],
                 }
                 
@@ -318,11 +299,11 @@ async def websocket_workflow_updates(websocket: WebSocket, workflow_id: str):
         workflow_manager = get_workflow_manager()
         
         async for update in workflow_manager.get_workflow_stream(workflow_id):
-            # Check if workflow is interrupted
-            is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
-            interrupt_data = None
-            if is_interrupted:
-                interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
+            # # Check if workflow is interrupted
+            # is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
+            # interrupt_data = None
+            # if is_interrupted:
+            #     interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
             
             # Format the update for WebSocket
             ws_data = {
@@ -331,10 +312,8 @@ async def websocket_workflow_updates(websocket: WebSocket, workflow_id: str):
                 "current_step": update["metadata"]["current_step"],
                 "execution_time": update["metadata"]["execution_time"],
                 "messages": format_workflow_messages(update["state"].get("messages", [])),
-                "is_interrupted": is_interrupted,
-                "interrupt_data": interrupt_data,
-                "requires_approval": is_interrupted or update["state"].get("approval_required", False),
-                "approval_message": update["state"].get("approval_message", ""),
+                "is_interrupted": False,
+                "requires_approval": False,
                 "timestamp": update["timestamp"],
             }
             
@@ -351,111 +330,13 @@ async def websocket_workflow_updates(websocket: WebSocket, workflow_id: str):
         await websocket.send_text(json.dumps(error_data))
 
 
-@router.post("/approval")
-@log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
-async def handle_approval(request: ApprovalRequest):
-    """Handle user approval for workflow steps requiring human intervention using LangGraph interrupts."""
-    try:
-        workflow_manager = get_workflow_manager()
-        
-        # Check if workflow is interrupted
-        if not workflow_manager.is_workflow_interrupted(request.workflow_id):
-            raise HTTPException(
-                status_code=400, 
-                detail="No approval required for this workflow - workflow is not interrupted"
-            )
-        
-        # Get interrupt data to validate the approval request
-        interrupt_data = workflow_manager.get_interrupt_data(request.workflow_id)
-        if not interrupt_data:
-            raise HTTPException(
-                status_code=404, 
-                detail="Interrupt data not found for this workflow"
-            )
-        
-        # Validate that this is a human approval interrupt
-        if interrupt_data.get("step") != "human_approval":
-            raise HTTPException(
-                status_code=400, 
-                detail="This interrupt is not for human approval"
-            )
-        
-        # Create approval decision
-        approval_decision = {
-            "approved": request.action == "approve",
-            "notes": request.comment or "No comment provided",
-            "user_id": "user",  # Default user ID - could be extracted from auth
-            "timestamp": datetime.now().isoformat(),
-            "action": request.action,
-        }
-        
-        # Resume workflow with approval decision
-        success = await workflow_manager.resume_workflow_with_approval(
-            request.workflow_id, 
-            approval_decision
-        )
-        
-        if not success:
-            raise HTTPException(
-                status_code=500, 
-                detail="Failed to resume workflow after approval"
-            )
-        
-        return {
-            "message": f"Approval {request.action} processed successfully",
-            "workflow_id": request.workflow_id,
-            "action": request.action,
-            "interrupt_data": interrupt_data,
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@router.get("/interrupted")
-@log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
-async def get_interrupted_workflows():
-    """Get list of workflows that are currently interrupted and waiting for approval."""
-    try:
-        workflow_manager = get_workflow_manager()
-        interrupted_workflows = workflow_manager.get_interrupted_workflows()
-        
-        return {
-            "interrupted_workflows": interrupted_workflows,
-            "count": len(interrupted_workflows),
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@router.get("/interrupt/{workflow_id}")
-@log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
-async def get_workflow_interrupt_data(workflow_id: str):
-    """Get interrupt data for a specific workflow."""
-    try:
-        workflow_manager = get_workflow_manager()
-        
-        if not workflow_manager.is_workflow_interrupted(workflow_id):
-            raise HTTPException(
-                status_code=404, 
-                detail="Workflow is not interrupted"
-            )
-        
-        interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
-        if not interrupt_data:
-            raise HTTPException(
-                status_code=404, 
-                detail="Interrupt data not found"
-            )
-        
-        return {
-            "workflow_id": workflow_id,
-            "interrupt_data": interrupt_data,
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+
 
 
 @router.post("/pause/{workflow_id}")

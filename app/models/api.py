@@ -143,19 +143,7 @@ class WorkflowState(BaseModel):
     data: Dict[str, Any] = Field(default={}, description="Workflow execution data")
 
 
-class ApprovalRequest(BaseModel):
-    """User approval request model."""
 
-    workflow_id: str = Field(..., description="Workflow identifier")
-    action: str = Field(..., description="Approval action: approve, deny, cancel")
-    comment: Optional[str] = Field(None, description="Optional approval comment")
-
-    @validator("action")
-    def validate_action(cls, v):
-        """Validate approval action."""
-        if v not in ["approve", "deny", "cancel"]:
-            raise ValueError("Action must be one of: approve, deny, cancel")
-        return v
 
 
 class ErrorResponse(BaseModel):

@@ -8,7 +8,7 @@ including chat endpoints, repository management, and health checks.
 import structlog
 from fastapi import APIRouter
 
-from app.api.endpoints import chat, health, repositories, workflow
+from app.api.endpoints import chat, health, repositories#, workflow
 
 logger = structlog.get_logger()
 
@@ -28,8 +28,8 @@ try:
         repositories.router, prefix="/repositories", tags=["repositories"]
     )
     
-    logger.info("Loading workflow endpoints", routes_count=len(workflow.router.routes))
-    api_router.include_router(workflow.router, prefix="/workflow", tags=["workflow"])
+    # logger.info("Loading workflow endpoints", routes_count=len(workflow.router.routes))
+    # api_router.include_router(workflow.router, prefix="/workflow", tags=["workflow"])
     
     logger.info("All API routers loaded successfully", total_routes=len(api_router.routes))
     
