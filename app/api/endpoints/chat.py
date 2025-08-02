@@ -383,9 +383,10 @@ async def get_workflow_status(workflow_id: str):
 @log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
 async def stream_workflow_updates(workflow_id: str):
     """
-    Stream real-time workflow updates.
+    Stream real-time AI message content from workflow updates.
     
-    Returns a Server-Sent Events stream of workflow state changes.
+    Returns a Server-Sent Events stream containing only AI message content
+    with timestamps, filtering out all other workflow data.
     """
     async def generate_stream() -> AsyncGenerator[str, None]:
         workflow_manager = get_workflow_manager_by_id(workflow_id)
@@ -396,25 +397,15 @@ async def stream_workflow_updates(workflow_id: str):
         
         try:
             async for update in workflow_manager.get_workflow_stream(workflow_id):
-                # Check if workflow is interrupted
-                # is_interrupted = workflow_manager.is_workflow_interrupted(workflow_id)
-                # interrupt_data = None
-                # if is_interrupted:
-                #     interrupt_data = workflow_manager.get_interrupt_data(workflow_id)
+                # Extract and filter AI messages only
+                messages = format_workflow_messages(update["state"])
+                ai_messages = [msg for msg in messages if msg.get("type") == "AIMessage"]
                 
-                # Format the update for SSE
-                sse_data = {
-                    "workflow_id": update["workflow_id"],
-                    "status": map_workflow_status(update["metadata"]["status"]),
-                    "current_step": update["metadata"]["current_step"],
-                    "execution_time": update["metadata"]["execution_time"],
-                    "messages": format_workflow_messages(update["state"]),
-                    "is_interrupted": False,
-                    "requires_approval": False,
-                    "timestamp": update["timestamp"],
-                }
-                
-                yield f"data: {json.dumps(sse_data)}\n\n"
+                # Stream only AI message content as raw text
+                for ai_msg in ai_messages:
+                    content = ai_msg.get("content", "")
+                    if content.strip():  # Only send non-empty content
+                        yield f"{content}\n\n"
                 
                 # Check if workflow is complete
                 if update["metadata"]["status"] in ["completed", "failed", "cancelled"]:
