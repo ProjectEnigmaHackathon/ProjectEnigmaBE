@@ -15,6 +15,7 @@ from ..base.github_interface import (
     GitHubRepository,
     GitHubTag,
 )
+from ..exceptions import GitHubMergeConflictError
 
 
 class MockGitHubClient(GitHubInterface):
@@ -262,6 +263,33 @@ class MockGitHubClient(GitHubInterface):
         self._mock_prs[repo_name].append(pr)
 
         return pr
+
+    async def merge_pull_request(
+        self, repo: str, pr_number: int, merge_method: str = "merge"
+    ) -> Dict[str, Any]:
+        """Mock merge pull request operation."""
+        await asyncio.sleep(0.5)  # Simulate API delay
+
+        # Simulate some merge conflicts for certain PR numbers
+        if pr_number % 5 == 0:  # 20% chance of conflict
+            raise GitHubMergeConflictError(
+                "feature/branch", "main", repo, "Mock merge conflict"
+            )
+
+        # Update the PR state in mock data
+        if repo in self._mock_prs:
+            for pr in self._mock_prs[repo]:
+                if pr.number == pr_number:
+                    pr.state = "closed"
+                    pr.merged_at = datetime.now().isoformat()
+                    break
+
+        return {
+            "merged": True,
+            "sha": f"merged{pr_number}sha1234567890abcdef1234567890abcdef12345678",
+            "message": f"Merge pull request #{pr_number} from feature/branch into main",
+            "merge_method": merge_method,
+        }
 
     async def merge_branches(
         self, repo_name: str, source_branch: str, target_branch: str

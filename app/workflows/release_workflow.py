@@ -818,19 +818,24 @@ def create_release_workflow() -> StateGraph:
 
                     # Check if branches exist and create PR
                     pr = await github_client.create_pull_request(
-                        repo=repo,
+                        repo_name=repo,
                         title=pr_title,
-                        head=state["sprint_name"],
-                        base="develop",
                         body=pr_description,
+                        head_branch=state["sprint_name"],
+                        base_branch="develop",
                     )
 
                     # Attempt to merge if no conflicts
                     try:
-                        merge_result = await github_client.merge_pull_request(
+                        # merge_result = await github_client.merge_pull_request(
+                        #     repo=repo,
+                        #     pr_number=pr.number,
+                        #     merge_method="merge",  # Can be 'merge', 'squash', or 'rebase'
+                        # )
+                        merge_result = await github_client.merge_branches(
                             repo=repo,
-                            pr_number=pr.number,
-                            merge_method="merge",  # Can be 'merge', 'squash', or 'rebase'
+                            repo_name=state["sprint_name"],
+                            target_branch="develop",
                         )
 
                         sprint_merge_results[repo] = {

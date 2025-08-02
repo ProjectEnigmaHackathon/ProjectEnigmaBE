@@ -149,6 +149,23 @@ class GitHubInterface(ABC):
         pass
 
     @abstractmethod
+    async def merge_pull_request(
+        self, repo: str, pr_number: int, merge_method: str = "merge"
+    ) -> Dict[str, Any]:
+        """
+        Merge a pull request.
+
+        Args:
+            repo: Repository name in format "owner/repo"
+            pr_number: Pull request number
+            merge_method: Merge method - 'merge', 'squash', or 'rebase'
+
+        Returns:
+            Dict[str, Any]: Merge result information including sha
+        """
+        pass
+
+    @abstractmethod
     async def merge_branches(
         self, repo_name: str, source_branch: str, target_branch: str
     ) -> Dict[str, Any]:

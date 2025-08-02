@@ -370,6 +370,82 @@ class RealGitHubClient(GitHubInterface):
             logger.error(f"Unexpected error creating PR: {str(e)}")
             raise GitHubError(f"Failed to create PR: {str(e)}")
 
+    async def merge_pull_request(
+        self, repo: str, pr_number: int, merge_method: str = "merge"
+    ) -> Dict[str, Any]:
+        """Merge a pull request."""
+        try:
+            await self.rate_limiter.acquire("github", "merge_pr")
+
+            client = self._get_client()
+            github_repo = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: client.get_repo(repo)
+            )
+
+            # Get the pull request
+            pr = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: github_repo.get_pull(pr_number)
+            )
+
+            # Check if PR is already merged
+            if pr.merged:
+                logger.info(f"PR #{pr_number} is already merged")
+                return {
+                    "merged": True,
+                    "sha": pr.merge_commit_sha,
+                    "message": f"PR #{pr_number} was already merged",
+                    "already_merged": True,
+                }
+
+            # Check if PR is mergeable
+            if pr.mergeable is False:
+                raise GitHubMergeConflictError(
+                    pr.head.ref, pr.base.ref, repo, "Pull request has merge conflicts"
+                )
+
+            # Merge the pull request
+            merge_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: pr.merge(merge_method=merge_method),
+            )
+
+            logger.info(f"Successfully merged PR #{pr_number} using {merge_method} method")
+            return {
+                "merged": True,
+                "sha": merge_result.sha,
+                "message": merge_result.message,
+                "merge_method": merge_method,
+            }
+
+        except UnknownObjectException:
+            raise GitHubRepositoryNotFoundError(repo)
+        except GithubException as e:
+            if e.status == 404:
+                # PR not found
+                raise ResourceNotFoundError("GitHub", "pull request", str(pr_number))
+            elif e.status == 409:
+                # Merge conflict or other merge-related error
+                raise GitHubMergeConflictError(
+                    "unknown", "unknown", repo, f"Merge conflict: {str(e)}"
+                )
+            elif e.status == 422:
+                # Validation failed - PR might be closed, already merged, etc.
+                raise GitHubError(
+                    f"PR merge failed - PR may be closed, already merged, or has restrictions: {str(e)}"
+                )
+            elif e.status == 429:
+                raise GitHubRateLimitError()
+            elif e.status == 401:
+                raise GitHubAuthenticationError("Authentication expired")
+            elif e.status == 403:
+                raise PermissionError("GitHub", "merge pull request")
+            else:
+                logger.error(f"GitHub merge PR failed: {str(e)}")
+                raise GitHubError(f"Failed to merge PR #{pr_number}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error merging PR #{pr_number}: {str(e)}")
+            raise GitHubError(f"Failed to merge PR: {str(e)}")
+
     async def merge_branches(
         self, repo_name: str, source_branch: str, target_branch: str
     ) -> Dict[str, Any]:
