@@ -260,6 +260,111 @@ class WorkflowManager:
         self._running_workflows: Dict[str, asyncio.Task] = {}
         self._interrupted_workflows: Dict[str, Dict[str, Any]] = {}
 
+    def _merge_state_update(self, accumulated_state: Dict[str, Any], current_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge a state update into the accumulated state, handling both flat and channel-based updates.
+        
+        Args:
+            accumulated_state: The current accumulated state
+            current_state: The new state update (could be partial channel update)
+            
+        Returns:
+            The merged state
+        """
+        # If current_state looks like a channel update (e.g., {'chatbot': {...}, 'tools': {...}})
+        if self._is_channel_based_state(current_state):
+            # Merge channel-based state
+            result = accumulated_state.copy()
+            for channel, channel_data in current_state.items():
+                if channel in result:
+                    # Merge channel data, especially messages
+                    if isinstance(channel_data, dict) and isinstance(result[channel], dict):
+                        merged_channel = result[channel].copy()
+                        for key, value in channel_data.items():
+                            if key == "messages" and isinstance(value, list):
+                                # Accumulate messages instead of replacing
+                                existing_messages = merged_channel.get("messages", [])
+                                if isinstance(existing_messages, list):
+                                    # Add new messages that aren't already present
+                                    merged_channel["messages"] = existing_messages + [
+                                        msg for msg in value 
+                                        if msg not in existing_messages
+                                    ]
+                                else:
+                                    merged_channel["messages"] = value
+                            else:
+                                merged_channel[key] = value
+                        result[channel] = merged_channel
+                    else:
+                        result[channel] = channel_data
+                else:
+                    result[channel] = channel_data
+            return result
+        else:
+            # For flat state updates, merge normally
+            result = accumulated_state.copy()
+            result.update(current_state)
+            return result
+
+    def _is_channel_based_state(self, state: Dict[str, Any]) -> bool:
+        """Check if this state update is channel-based (LangGraph style)."""
+        # Common LangGraph channel names
+        langgraph_channels = {'messages', 'chatbot', 'tools', 'agent', 'start', 'end'}
+        
+        # If state has channels but no workflow-specific keys, it's likely channel-based
+        state_keys = set(state.keys())
+        workflow_keys = {'workflow_id', 'current_step', 'workflow_complete', 'messages', 'repositories'}
+        
+        # It's channel-based if it has LangGraph channels and no flat workflow keys
+        has_channels = bool(state_keys.intersection(langgraph_channels))
+        has_workflow_keys = bool(state_keys.intersection(workflow_keys))
+        
+        # Special case: if it only has 'messages' at top level, it might be flat
+        if state_keys == {'messages'}:
+            return False
+            
+        return has_channels and not has_workflow_keys
+
+    def _is_channel_workflow_complete(self, accumulated_state: Dict[str, Any]) -> bool:
+        """
+        Determine if a channel-based workflow is complete.
+        
+        For LangGraph workflows, we consider them complete if:
+        1. The last message in any channel is not a tool call
+        2. There are no pending tool calls
+        """
+        # Look through all channels for the most recent message
+        last_message = None
+        
+        for channel_name in ['chatbot', 'tools', 'agent']:
+            if channel_name in accumulated_state:
+                channel_data = accumulated_state[channel_name]
+                if isinstance(channel_data, dict) and 'messages' in channel_data:
+                    messages = channel_data['messages']
+                    if isinstance(messages, list) and messages:
+                        # Get the last message from this channel
+                        channel_last_msg = messages[-1]
+                        last_message = channel_last_msg
+                    elif hasattr(messages, 'content'):
+                        # Single message object
+                        last_message = messages
+        
+        # If we found a last message, check if it has tool calls
+        if last_message:
+            # Check if it's an AI message with tool calls
+            if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+                return False  # Still has pending tool calls
+            
+            # Check if it's a message with additional_kwargs containing tool_calls
+            if hasattr(last_message, 'additional_kwargs') and last_message.additional_kwargs:
+                if 'tool_calls' in last_message.additional_kwargs:
+                    tool_calls = last_message.additional_kwargs['tool_calls']
+                    if tool_calls:
+                        return False  # Still has pending tool calls
+        
+        # If no tool calls are pending, workflow is likely complete
+        return True
+
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def start_workflow(
@@ -328,9 +433,14 @@ class WorkflowManager:
             config = {"configurable": {"thread_id": workflow_id}}
             print(f"[DEBUG] Created config for workflow: {config}")
 
+            # Initialize accumulated state
+            accumulated_state = initial_state.copy()
+            workflow_complete = False
+            
             # Stream workflow execution with config
             async for event in self.workflow.astream(initial_state, config=config):
                 print(f"[DEBUG] Received event from workflow: {event}")
+                
                 # Handle different event formats from LangGraph
                 if isinstance(event, dict):
                     # Check if this is a nested state (e.g., {'start': {...}})
@@ -339,42 +449,60 @@ class WorkflowManager:
                         current_state = list(event.values())[0]
                         print(f"[DEBUG] Extracted nested state: {current_state}")
                     else:
-                        # Regular state update
+                        # Regular state update - could be channel-based or flat
                         current_state = event
                 else:
                     current_state = event
 
                 print(f"[DEBUG] Current state: {current_state}")
 
+                # Merge current state into accumulated state
+                accumulated_state = self._merge_state_update(accumulated_state, current_state)
+                print(f"[DEBUG] Accumulated state: {accumulated_state}")
+
                 # Update metadata
-                metadata.current_step = current_state.get("current_step", "unknown")
+                metadata.current_step = accumulated_state.get("current_step", "unknown")
                 metadata.execution_time = time.time() - start_time
                 print(f"[DEBUG] Updated metadata: {metadata}")
 
-                # Store updated state
-                self.state_store.store_state(workflow_id, current_state, metadata)
-                print(f"[DEBUG] Stored updated state for workflow_id: {workflow_id}")
+                # Store accumulated state (not just the partial update)
+                self.state_store.store_state(workflow_id, accumulated_state, metadata)
+                print(f"[DEBUG] Stored accumulated state for workflow_id: {workflow_id}")
 
                 # Persist periodically
                 if (
                     self.persistence and metadata.execution_time % 30 < 1
                 ):  # Every ~30 seconds
-                    self.persistence.save_state(workflow_id, current_state, metadata)
+                    self.persistence.save_state(workflow_id, accumulated_state, metadata)
                     print(f"[DEBUG] Periodically persisted state for workflow_id: {workflow_id}")
 
-                # Check if workflow is complete
-                if current_state.get("workflow_complete", False):
-                    print(f"[DEBUG] Workflow {workflow_id} marked as complete.")
+                # Check if workflow is complete (for flat state workflows)
+                if accumulated_state.get("workflow_complete", False):
+                    print(f"[DEBUG] Workflow {workflow_id} marked as complete via workflow_complete flag.")
                     metadata.status = "completed"
+                    workflow_complete = True
                     break
 
+                # For LangGraph channel-based workflows, check if no more tool calls are expected
+                # This is a heuristic - workflow is complete if last message is not a tool call
+                if self._is_channel_workflow_complete(accumulated_state):
+                    print(f"[DEBUG] Channel-based workflow {workflow_id} appears complete.")
+                    metadata.status = "completed"
+                    workflow_complete = True
+                    # Don't break here - let the workflow naturally end
+
                 # Check for errors (but not if workflow is paused)
-                if current_state.get("error") and not current_state.get("workflow_paused"):
-                    print(f"[ERROR] Workflow {workflow_id} encountered error: {current_state.get('error')}")
+                if accumulated_state.get("error") and not accumulated_state.get("workflow_paused"):
+                    print(f"[ERROR] Workflow {workflow_id} encountered error: {accumulated_state.get('error')}")
                     metadata.error_count += 1
-                    metadata.last_error = current_state["error"]
+                    metadata.last_error = accumulated_state["error"]
                     metadata.status = "failed"
                     break
+
+            # If workflow ended naturally and not explicitly marked complete, mark as completed
+            if not workflow_complete and metadata.status == "running":
+                print(f"[DEBUG] Workflow {workflow_id} ended naturally, marking as completed.")
+                metadata.status = "completed"
 
             # Final state save
             final_state = self.state_store.get_state(workflow_id)

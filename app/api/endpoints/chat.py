@@ -112,8 +112,99 @@ def map_workflow_status(workflow_status: str) -> WorkflowStatus:
     return status_mapping.get(workflow_status, WorkflowStatus.PENDING)
 
 
-def format_workflow_messages(messages: List) -> List[Dict[str, any]]:
+def extract_messages_from_state(state: Dict[str, any]) -> List:
+    """Extract messages from workflow state, handling both flat and channel-based structures."""
+    messages = []
+    
+    # Check if we have channel-based data (accumulated state with chatbot/tools channels)
+    has_channels = any(channel in state for channel in ['chatbot', 'tools', 'agent'])
+    
+    if has_channels:
+        # Handle LangGraph channel-based structure (e.g., QA workflow)
+        # For accumulated state, we need to collect messages from all channels in chronological order
+        
+        # First, include any initial flat messages (from the original workflow state)
+        if "messages" in state and isinstance(state["messages"], list):
+            messages.extend(state["messages"])
+        
+        # Then, collect all messages from channels
+        all_channel_messages = []
+        channels_to_check = ['chatbot', 'tools', 'start', 'agent']
+        
+        for channel in channels_to_check:
+            if channel in state and isinstance(state[channel], dict):
+                channel_data = state[channel]
+                if "messages" in channel_data:
+                    if isinstance(channel_data["messages"], list):
+                        for msg in channel_data["messages"]:
+                            all_channel_messages.append((channel, msg))
+                    elif hasattr(channel_data["messages"], 'content'):
+                        # Single message object
+                        all_channel_messages.append((channel, channel_data["messages"]))
+        
+        # For QA workflow, we want to reconstruct the conversation flow:
+        # 1. Initial human message (from flat messages or chatbot channel)
+        # 2. AI message with tool calls (from chatbot channel)  
+        # 3. Tool response (from tools channel)
+        # 4. Final AI response (from chatbot channel)
+        
+        # Sort messages to maintain conversation flow
+        # Human messages first, then AI messages with tool calls, then tool messages, then final AI messages
+        def message_sort_key(channel_msg_tuple):
+            channel, msg = channel_msg_tuple
+            msg_type = msg.__class__.__name__ if hasattr(msg, '__class__') else 'Unknown'
+            
+            # Priority order for conversation flow
+            if msg_type == 'HumanMessage':
+                return (0, 0)  # Human messages first
+            elif msg_type == 'AIMessage':
+                # Check if it has tool calls
+                has_tool_calls = (
+                    (hasattr(msg, 'tool_calls') and msg.tool_calls) or
+                    (hasattr(msg, 'additional_kwargs') and 
+                     msg.additional_kwargs.get('tool_calls'))
+                )
+                if has_tool_calls:
+                    return (1, 0)  # AI messages with tool calls
+                else:
+                    return (3, 0)  # Final AI messages
+            elif msg_type == 'ToolMessage':
+                return (2, 0)  # Tool responses
+            else:
+                return (4, 0)  # Other messages last
+        
+        # Sort and extract just the messages from channels
+        if all_channel_messages:
+            sorted_messages = sorted(all_channel_messages, key=message_sort_key)
+            channel_messages = [msg for channel, msg in sorted_messages]
+            
+            # Add channel messages, avoiding duplicates with initial flat messages
+            for msg in channel_messages:
+                if msg not in messages:
+                    messages.append(msg)
+        
+        return messages
+    else:
+        # Handle flat structure (e.g., release workflow) - no channels detected
+        if "messages" in state and isinstance(state["messages"], list):
+            return state["messages"]
+        
+        # If no messages found anywhere, try to find any message-like objects
+        for key, value in state.items():
+            if hasattr(value, 'content') or (isinstance(value, dict) and "content" in value):
+                messages.append(value)
+        
+        return messages
+
+
+def format_workflow_messages(state_or_messages) -> List[Dict[str, any]]:
     """Format workflow messages for API response."""
+    # If it's a state dict, extract messages first
+    if isinstance(state_or_messages, dict):
+        messages = extract_messages_from_state(state_or_messages)
+    else:
+        messages = state_or_messages if isinstance(state_or_messages, list) else []
+    
     formatted_messages = []
     
     for msg in messages:
@@ -216,7 +307,7 @@ async def send_message(request: ChatRequest):
             "workflow_id": workflow_id,
             "session_id": workflow_id,  # Use workflow_id as session_id
             "current_step": status_info["metadata"]["current_step"],
-            "messages": format_workflow_messages(status_info["state"].get("messages", [])),
+            "messages": format_workflow_messages(status_info["state"]),
         }
         
 
@@ -276,7 +367,7 @@ async def get_workflow_status(workflow_id: str):
             "execution_time": status_info["metadata"]["execution_time"],
             "error_count": status_info["metadata"]["error_count"],
             "last_error": status_info["metadata"]["last_error"],
-            "messages": format_workflow_messages(status_info["state"].get("messages", [])),
+            "messages": format_workflow_messages(status_info["state"]),
             "is_running": status_info["is_running"],
             "is_interrupted": False,
             "requires_approval": False,
@@ -317,7 +408,7 @@ async def stream_workflow_updates(workflow_id: str):
                     "status": map_workflow_status(update["metadata"]["status"]),
                     "current_step": update["metadata"]["current_step"],
                     "execution_time": update["metadata"]["execution_time"],
-                    "messages": format_workflow_messages(update["state"].get("messages", [])),
+                    "messages": format_workflow_messages(update["state"]),
                     "is_interrupted": False,
                     "requires_approval": False,
                     "timestamp": update["timestamp"],
@@ -370,7 +461,7 @@ async def websocket_workflow_updates(websocket: WebSocket, workflow_id: str):
                 "status": map_workflow_status(update["metadata"]["status"]),
                 "current_step": update["metadata"]["current_step"],
                 "execution_time": update["metadata"]["execution_time"],
-                "messages": format_workflow_messages(update["state"].get("messages", [])),
+                "messages": format_workflow_messages(update["state"]),
                 "is_interrupted": False,
                 "requires_approval": False,
                 "timestamp": update["timestamp"],
