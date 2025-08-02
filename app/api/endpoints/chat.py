@@ -25,56 +25,77 @@ from app.models.api import (
 )
 from app.workflows.workflow_manager import get_workflow_manager
 from app.workflows.release_workflow import extract_workflow_params
+from app.workflows.orchestrator import get_orchestrator
+from app.workflows.workflow_registry import get_workflow_manager_by_type, get_workflow_manager_by_id
 from app.core.logging_utils import log_api_endpoint, LogLevel
 
 router = APIRouter()
 
 
-def create_initial_workflow_state(request: ChatRequest) -> Dict[str, any]:
+def create_initial_workflow_state(request: ChatRequest, workflow_type: str) -> Dict[str, any]:
     """Create initial workflow state from chat request."""
-    # Extract workflow parameters
-    params = extract_workflow_params(request)
     
-    # Create initial state matching WorkflowState TypedDict
-    initial_state = {
-        # Core workflow data
-        "messages": [HumanMessage(content=request.message)],
-        "repositories": params["repositories"],
-        "fix_version": params["fix_version"],
-        "sprint_name": params["sprint_name"],
-        "release_type": params["release_type"],
+    if workflow_type == "release":
+        # Extract workflow parameters for release workflow
+        params = extract_workflow_params(request)
         
-        # Execution tracking
-        "current_step": "start",
-        "workflow_complete": False,
-        "workflow_id": str(uuid.uuid4()),
-        "workflow_paused": False,
-        
-        # Step results (initialize empty)
-        "jira_tickets": [],
-        "feature_branches": {},
-        "merge_status": {},
-        "pull_requests": [],
-        "release_branches": [],
-        "rollback_branches": [],
-        "confluence_url": "",
-        
-        # Error handling and recovery
-        "error": "",
-        "error_step": "",
-        "retry_count": 0,
-        "can_continue": True,
-        
-        # Progress tracking
-        "steps_completed": [],
-        "steps_failed": [],
-        
-        # Human approval system
-        "approval_required": False,
-        "approval_message": "",
-        "approval_id": "",
-        "approval_decision": {},
-    }
+        # Create initial state matching Release WorkflowState TypedDict
+        initial_state = {
+            # Workflow type identification
+            "workflow_type": workflow_type,
+            
+            # Core workflow data
+            "messages": [HumanMessage(content=request.message)],
+            "repositories": params["repositories"],
+            "fix_version": params["fix_version"],
+            "sprint_name": params["sprint_name"],
+            "release_type": params["release_type"],
+            
+            # Execution tracking
+            "current_step": "start",
+            "workflow_complete": False,
+            "workflow_id": str(uuid.uuid4()),
+            "workflow_paused": False,
+            
+            # Step results (initialize empty)
+            "jira_tickets": [],
+            "feature_branches": {},
+            "merge_status": {},
+            "pull_requests": [],
+            "release_branches": [],
+            "rollback_branches": [],
+            "confluence_url": "",
+            
+            # Error handling and recovery
+            "error": "",
+            "error_step": "",
+            "retry_count": 0,
+            "can_continue": True,
+            
+            # Progress tracking
+            "steps_completed": [],
+            "steps_failed": [],
+        }
+    else:  # qa workflow
+        # Create initial state for QA workflow
+        initial_state = {
+            # Workflow type identification
+            "workflow_type": workflow_type,
+            
+            # Core data
+            "messages": [HumanMessage(content=request.message)],
+            "repositories": request.repositories or [],
+            
+            # Execution tracking
+            "workflow_id": str(uuid.uuid4()),
+            "current_step": "start",
+            "workflow_complete": False,
+            "workflow_paused": False,
+            
+            # Error handling
+            "error": "",
+            "can_continue": True,
+        }
     
     return initial_state
 
@@ -128,15 +149,14 @@ async def send_message(request: ChatRequest):
     Send a chat message and start/continue workflow execution.
     
     This endpoint handles both new workflow starts and continuation of existing workflows.
+    Uses LLM orchestrator to decide between QA and Release workflows.
     """
     try:
-        workflow_manager = get_workflow_manager()
-        
         # Check if this is a continuation of an existing workflow
         if request.session_id:
-            # Try to resume existing workflow
-            workflow_status = workflow_manager.get_workflow_status(request.session_id)
-            if workflow_status:
+            # Try to find existing workflow across all managers
+            workflow_manager = get_workflow_manager_by_id(request.session_id)
+            if workflow_manager:
                 # Resume existing workflow
                 success = await workflow_manager.resume_workflow(request.session_id)
                 if not success:
@@ -148,11 +168,39 @@ async def send_message(request: ChatRequest):
                 workflow_id = request.session_id
             else:
                 # Session ID provided but workflow not found, start new
-                initial_state = create_initial_workflow_state(request)
+                # Use orchestrator to classify workflow type
+                orchestrator = get_orchestrator()
+                classification = await orchestrator.classify_workflow(request.message)
+                workflow_type = classification["workflow_type"]
+                
+                # Get appropriate workflow manager
+                workflow_manager = get_workflow_manager_by_type(workflow_type)
+                if not workflow_manager:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Workflow manager not found for type: {workflow_type}"
+                    )
+                
+                initial_state = create_initial_workflow_state(request, workflow_type)
                 workflow_id = await workflow_manager.start_workflow(initial_state)
         else:
-            # Start new workflow
-            initial_state = create_initial_workflow_state(request)
+            # Start new workflow - use orchestrator to classify
+            orchestrator = get_orchestrator()
+            classification = await orchestrator.classify_workflow(request.message)
+            workflow_type = classification["workflow_type"]
+            
+            print(f"Orchestrator classified message as: {workflow_type} (confidence: {classification.get('confidence', 'N/A')})")
+            print(f"Reasoning: {classification.get('reasoning', 'N/A')}")
+            
+            # Get appropriate workflow manager
+            workflow_manager = get_workflow_manager_by_type(workflow_type)
+            if not workflow_manager:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Workflow manager not found for type: {workflow_type}"
+                )
+            
+            initial_state = create_initial_workflow_state(request, workflow_type)
             workflow_id = await workflow_manager.start_workflow(initial_state)
         
         # Get current workflow status
@@ -206,7 +254,10 @@ async def send_message(request: ChatRequest):
 async def get_workflow_status(workflow_id: str):
     """Get current status of a workflow."""
     try:
-        workflow_manager = get_workflow_manager()
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+            
         status_info = workflow_manager.get_workflow_status(workflow_id)
         
         if not status_info:
@@ -246,7 +297,11 @@ async def stream_workflow_updates(workflow_id: str):
     Returns a Server-Sent Events stream of workflow state changes.
     """
     async def generate_stream() -> AsyncGenerator[str, None]:
-        workflow_manager = get_workflow_manager()
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            error_data = {"error": f"Workflow not found: {workflow_id}"}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            return
         
         try:
             async for update in workflow_manager.get_workflow_stream(workflow_id):
@@ -296,7 +351,11 @@ async def websocket_workflow_updates(websocket: WebSocket, workflow_id: str):
     await websocket.accept()
     
     try:
-        workflow_manager = get_workflow_manager()
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            error_data = {"error": f"Workflow not found: {workflow_id}"}
+            await websocket.send_text(json.dumps(error_data))
+            return
         
         async for update in workflow_manager.get_workflow_stream(workflow_id):
             # # Check if workflow is interrupted
@@ -344,7 +403,9 @@ async def websocket_workflow_updates(websocket: WebSocket, workflow_id: str):
 async def pause_workflow(workflow_id: str):
     """Pause a running workflow."""
     try:
-        workflow_manager = get_workflow_manager()
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            raise HTTPException(status_code=404, detail="Workflow not found")
         success = await workflow_manager.pause_workflow(workflow_id)
         
         if not success:
@@ -364,7 +425,9 @@ async def pause_workflow(workflow_id: str):
 async def cancel_workflow(workflow_id: str):
     """Cancel a workflow."""
     try:
-        workflow_manager = get_workflow_manager()
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            raise HTTPException(status_code=404, detail="Workflow not found")
         success = await workflow_manager.cancel_workflow(workflow_id)
         
         if not success:
@@ -382,10 +445,18 @@ async def cancel_workflow(workflow_id: str):
 @router.get("/list")
 @log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
 async def list_workflows():
-    """List all active workflows."""
+    """List all active workflows from all workflow types."""
     try:
-        workflow_manager = get_workflow_manager()
-        workflows = workflow_manager.list_workflows()
+        from app.workflows.workflow_registry import get_workflow_registry
+        registry = get_workflow_registry()
+        all_workflows = registry.get_all_workflows()
+        
+        # Flatten workflows from all types
+        workflows = []
+        for workflow_type, type_workflows in all_workflows.items():
+            for workflow in type_workflows:
+                workflow["workflow_type"] = workflow_type
+                workflows.append(workflow)
         
         return {
             "workflows": workflows,
@@ -401,7 +472,10 @@ async def list_workflows():
 async def delete_workflow(workflow_id: str):
     """Delete a workflow and its associated data."""
     try:
-        workflow_manager = get_workflow_manager()
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+            
         success = workflow_manager.state_store.delete_workflow(workflow_id)
         
         if not success:

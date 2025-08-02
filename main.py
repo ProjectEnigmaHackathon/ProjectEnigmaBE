@@ -56,7 +56,16 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     config_dir = Path("config")
     config_dir.mkdir(exist_ok=True)
-
+    
+    # Initialize workflow system
+    try:
+        from app.workflows.initialization import initialize_workflow_system
+        initialize_workflow_system()
+        logger.info("Workflow system initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize workflow system: {e}")
+        # Don't fail startup, but log the error
+    
     yield
 
     # Shutdown
