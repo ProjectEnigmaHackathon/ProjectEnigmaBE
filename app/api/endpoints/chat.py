@@ -10,11 +10,11 @@ import json
 import uuid
 from typing import AsyncGenerator, Dict, List, Optional
 from datetime import datetime
-
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect, status, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import ValidationError
+import structlog
 
 from app.models.api import (
     ChatRequest,
@@ -29,7 +29,12 @@ from app.workflows.orchestrator import get_orchestrator
 from app.workflows.workflow_registry import get_workflow_manager_by_type, get_workflow_manager_by_id
 from app.core.logging_utils import log_api_endpoint, LogLevel
 
+logger = structlog.get_logger()
 router = APIRouter()
+
+# Constants for logging
+APPLICATION_NAME = "ProjectEnigmaBE"
+filename = __file__.split('/')[-1]
 
 
 def create_initial_workflow_state(request: ChatRequest, workflow_type: str) -> Dict[str, any]:
@@ -381,22 +386,63 @@ async def get_workflow_status(workflow_id: str):
 
 @router.get("/stream/{workflow_id}")
 @log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
-async def stream_workflow_updates(workflow_id: str):
+async def stream_workflow_updates(workflow_id: str, request: Request):
     """
     Stream real-time AI message content from workflow updates.
     
     Returns a Server-Sent Events stream containing only AI message content
     with timestamps, filtering out all other workflow data.
     """
+    # Simple state tracking
+    class StreamState:
+        def __init__(self):
+            self.full_content = ""
+            self.last_status = "running"
+    
+    state = StreamState()
+    background_tasks = BackgroundTasks()
+    
+    # Background task for cleanup/logging
+    async def cleanup_stream(completed=False, error=None):
+        try:
+            await logger.ainfo({
+                "message": f"Workflow stream ended: {workflow_id}",
+                "status": "completed" if completed else "disconnected",
+                "content_length": len(state.full_content),
+                "final_status": state.last_status,
+                "error": str(error) if error else None,
+                "appName": APPLICATION_NAME,
+                "fileName": filename,
+                "methodName": "cleanup_stream",
+            })
+        except Exception as cleanup_error:
+            await logger.aerror({
+                "message": f"Error in stream cleanup: {str(cleanup_error)}",
+                "appName": APPLICATION_NAME,
+                "fileName": filename,
+                "methodName": "cleanup_stream",
+            }, cleanup_error)
+    
     async def generate_stream() -> AsyncGenerator[str, None]:
         workflow_manager = get_workflow_manager_by_id(workflow_id)
         if not workflow_manager:
-            error_data = {"error": f"Workflow not found: {workflow_id}"}
-            yield f"data: {json.dumps(error_data)}\n\n"
+            error_msg = f"Workflow not found: {workflow_id}"
+            yield f"Error: {error_msg}\n\n"
+            await cleanup_stream(True, Exception(error_msg))
             return
         
         try:
             async for update in workflow_manager.get_workflow_stream(workflow_id):
+                # Check for client disconnection
+                if await request.is_disconnected():
+                    disconnect_error = Exception("Client disconnected during streaming")
+                    await cleanup_stream(False, disconnect_error)
+                    break
+                
+                # Update status tracking
+                current_status = update["metadata"]["status"]
+                state.last_status = current_status
+                
                 # Extract and filter AI messages only
                 messages = format_workflow_messages(update["state"])
                 ai_messages = [msg for msg in messages if msg.get("type") == "AIMessage"]
@@ -405,24 +451,163 @@ async def stream_workflow_updates(workflow_id: str):
                 for ai_msg in ai_messages:
                     content = ai_msg.get("content", "")
                     if content.strip():  # Only send non-empty content
+                        state.full_content += content
                         yield f"{content}\n\n"
                 
                 # Check if workflow is complete
-                if update["metadata"]["status"] in ["completed", "failed", "cancelled"]:
+                if current_status in ["completed", "failed", "cancelled"]:
+                    await cleanup_stream(True, None)
                     break
                     
+        except asyncio.CancelledError:
+            # Handle client disconnection via cancellation
+            cancel_error = Exception("Client disconnected (cancelled) before completion")
+            await cleanup_stream(False, cancel_error)
+            raise
+            
         except Exception as e:
-            error_data = {"error": str(e)}
-            yield f"data: {json.dumps(error_data)}\n\n"
+            await cleanup_stream(True, e)
+            yield f"Error: {str(e)}\n\n"
+    
+    # Add cleanup task to background
+    background_tasks.add_task(cleanup_stream, False, None)
     
     return StreamingResponse(
         generate_stream(),
-        media_type="text/plain",
+        media_type="text/plain; charset=utf-8",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "Content-Type": "text/event-stream",
-        }
+            "X-Content-Type-Options": "nosniff",
+        },
+        status_code=status.HTTP_200_OK,
+        background=background_tasks,
+    )
+
+
+@router.get("/stream-sse/{workflow_id}")
+@log_api_endpoint(level=LogLevel.INFO, include_request=True, include_response=False, include_execution_time=True, log_errors=True)
+async def stream_workflow_updates_sse(workflow_id: str, request: Request):
+    """
+    Stream real-time AI message content using Server-Sent Events format.
+    
+    This endpoint provides proper SSE formatting for better browser and Postman support.
+    Use this endpoint when you need proper SSE event streaming.
+    """
+    # Simple state tracking
+    class StreamState:
+        def __init__(self):
+            self.full_content = ""
+            self.last_status = "running"
+    
+    state = StreamState()
+    background_tasks = BackgroundTasks()
+    
+    # Background task for cleanup/logging
+    async def cleanup_stream(completed=False, error=None):
+        try:
+            await logger.ainfo({
+                "message": f"SSE Workflow stream ended: {workflow_id}",
+                "status": "completed" if completed else "disconnected",
+                "content_length": len(state.full_content),
+                "final_status": state.last_status,
+                "error": str(error) if error else None,
+                "appName": APPLICATION_NAME,
+                "fileName": filename,
+                "methodName": "cleanup_stream_sse",
+            })
+        except Exception as cleanup_error:
+            await logger.aerror({
+                "message": f"Error in SSE stream cleanup: {str(cleanup_error)}",
+                "appName": APPLICATION_NAME,
+                "fileName": filename,
+                "methodName": "cleanup_stream_sse",
+            }, cleanup_error)
+    
+    async def generate_sse_stream() -> AsyncGenerator[str, None]:
+        workflow_manager = get_workflow_manager_by_id(workflow_id)
+        if not workflow_manager:
+            error_msg = f"Workflow not found: {workflow_id}"
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+            await cleanup_stream(True, Exception(error_msg))
+            return
+        
+        try:
+            async for update in workflow_manager.get_workflow_stream(workflow_id):
+                # Check for client disconnection
+                if await request.is_disconnected():
+                    disconnect_error = Exception("Client disconnected during SSE streaming")
+                    await cleanup_stream(False, disconnect_error)
+                    break
+                
+                # Update status tracking
+                current_status = update["metadata"]["status"]
+                state.last_status = current_status
+                
+                # Extract and filter AI messages only
+                messages = format_workflow_messages(update["state"])
+                ai_messages = [msg for msg in messages if msg.get("type") == "AIMessage"]
+                
+                # Stream AI message content in SSE format
+                for ai_msg in ai_messages:
+                    content = ai_msg.get("content", "")
+                    if content.strip():  # Only send non-empty content
+                        state.full_content += content
+                        # Proper SSE format with JSON data
+                        sse_data = {
+                            "content": content,
+                            "workflow_id": workflow_id,
+                            "status": current_status,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        yield f"data: {json.dumps(sse_data)}\n\n"
+                
+                # Send status updates
+                status_data = {
+                    "type": "status",
+                    "workflow_id": workflow_id,
+                    "status": current_status,
+                    "timestamp": datetime.now().isoformat()
+                }
+                yield f"data: {json.dumps(status_data)}\n\n"
+                
+                # Check if workflow is complete
+                if current_status in ["completed", "failed", "cancelled"]:
+                    await cleanup_stream(True, None)
+                    # Send completion event
+                    completion_data = {
+                        "type": "completion",
+                        "workflow_id": workflow_id,
+                        "status": current_status,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    yield f"data: {json.dumps(completion_data)}\n\n"
+                    break
+                    
+        except asyncio.CancelledError:
+            # Handle client disconnection via cancellation
+            cancel_error = Exception("Client disconnected (cancelled) before SSE completion")
+            await cleanup_stream(False, cancel_error)
+            raise
+            
+        except Exception as e:
+            await cleanup_stream(True, e)
+            error_data = {"error": str(e), "timestamp": datetime.now().isoformat()}
+            yield f"data: {json.dumps(error_data)}\n\n"
+    
+    # Add cleanup task to background
+    background_tasks.add_task(cleanup_stream, False, None)
+    
+    return StreamingResponse(
+        generate_sse_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+        status_code=status.HTTP_200_OK,
+        background=background_tasks,
     )
 
 
