@@ -75,6 +75,10 @@ class Settings(BaseSettings):
         default="development-secret-key-change-in-production",
         description="Secret key for sessions",
     )
+    openapi_key: str = Field(
+        default="",
+        description="OpenAPI Secret key",
+    )
 
     @validator("environment")
     def validate_environment(cls, v):

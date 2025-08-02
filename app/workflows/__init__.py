@@ -11,6 +11,7 @@ from .release_workflow import (
     extract_workflow_params,
 )
 from .workflow_manager import WorkflowManager, get_workflow_manager
+from .qa_workflow import QAWorkflow, create_qa_workflow
 
 __all__ = [
     "WorkflowManager",
@@ -18,4 +19,6 @@ __all__ = [
     "create_release_workflow",
     "WorkflowState",
     "extract_workflow_params",
+    "QAWorkflow",
+    "create_qa_workflow",
 ]
