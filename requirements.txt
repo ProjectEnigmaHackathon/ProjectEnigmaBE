@@ -1,0 +1,46 @@
+# FastAPI and server dependencies
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart==0.0.6
+
+# LangGraph and AI dependencies
+langgraph>=0.6.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-core>=0.3.0
+
+# API client dependencies
+PyGithub==1.59.1
+jira==3.5.2
+atlassian-python-api==3.41.6
+requests==2.31.0
+httpx==0.25.2
+
+# Data validation and serialization
+pydantic>=2.7.4,<3.0.0
+pydantic-settings>=2.1.0
+
+# Environment and configuration
+python-dotenv==1.0.0
+
+# Logging and monitoring
+structlog==23.2.0
+
+# Testing dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+respx==0.20.2
+
+# Development dependencies
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Additional utilities
+aiofiles==23.2.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+psutil>=7.0.0
+beautifulsoup4>=4.12.0
