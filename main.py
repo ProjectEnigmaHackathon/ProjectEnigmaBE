@@ -28,6 +28,7 @@ from app.core.middleware import (
     SecurityHeadersMiddleware,
 )
 
+
 def setup_logging() -> None:
     """Configure enhanced structured logging for the application."""
     from app.core.logging import setup_enhanced_logging
@@ -56,16 +57,17 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     config_dir = Path("config")
     config_dir.mkdir(exist_ok=True)
-    
+
     # Initialize workflow system
     try:
         from app.workflows.initialization import initialize_workflow_system
+
         initialize_workflow_system()
         logger.info("Workflow system initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize workflow system: {e}")
         # Don't fail startup, but log the error
-    
+
     yield
 
     # Shutdown
@@ -90,7 +92,7 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -108,11 +110,15 @@ def create_app() -> FastAPI:
         logger.info("Including API routes", router_routes=len(api_router.routes))
         app.include_router(api_router, prefix="/api")
         logger.info("API routes included successfully")
-        
+
         # Debug: Print all registered routes
         for route in app.routes:
-            if hasattr(route, 'path'):
-                logger.info("Registered route", path=route.path, methods=getattr(route, 'methods', []))
+            if hasattr(route, "path"):
+                logger.info(
+                    "Registered route",
+                    path=route.path,
+                    methods=getattr(route, "methods", []),
+                )
     except Exception as e:
         logger.error("Failed to include API routes", error=str(e))
         raise
@@ -163,7 +169,7 @@ async def root():
         "version": "0.1.0",
         "docs": "/docs",
         "health": "/health",
-        "api_base": "/api"
+        "api_base": "/api",
     }
 
 
@@ -172,6 +178,7 @@ async def root():
 async def redirect_to_docs():
     """Redirect to the main docs page."""
     from fastapi.responses import RedirectResponse
+
     return RedirectResponse(url="/docs")
 
 
