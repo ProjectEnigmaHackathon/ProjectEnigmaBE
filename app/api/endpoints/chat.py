@@ -452,7 +452,7 @@ async def stream_workflow_updates(workflow_id: str, request: Request):
                     content = ai_msg.get("content", "")
                     if content.strip():  # Only send non-empty content
                         state.full_content += content
-                        yield f"{content}\n\n"
+                        yield f"{content}"
                 
                 # Check if workflow is complete
                 if current_status in ["completed", "failed", "cancelled"]:
