@@ -34,7 +34,7 @@ class WorkflowRegistry:
             
             # Initialize QA Workflow Manager
             print("Initializing QA workflow...")
-            qa_workflow = create_qa_workflow(llm=llm, use_mock=True)
+            qa_workflow = create_qa_workflow(llm=llm, use_mock=False)
             qa_manager = WorkflowManager(qa_workflow.graph, enable_persistence=True)
             self._managers["qa"] = qa_manager
             
