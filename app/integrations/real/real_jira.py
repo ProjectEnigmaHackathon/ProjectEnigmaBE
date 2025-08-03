@@ -314,3 +314,94 @@ class RealJiraClient(JiraInterface):
         except Exception as e:
             logger.error(f"Unexpected error validating JIRA connection: {str(e)}")
             raise APIConnectionError("JIRA", self.base_url, str(e))
+    
+    async def get_ticket_ids_by_custom_field(
+        self, custom_field_name: str, custom_field_value: str, project_keys: Optional[List[str]] = None
+    ) -> List[JiraTicket]:
+        """
+        Fetch JIRA tickets based on custom field name and value.
+
+        Args:
+            custom_field_name (str): Name of the custom field (e.g., "Sprint", "Epic Link")
+            custom_field_value (str): Value to search for
+            project_keys (list, optional): List of project keys to filter by
+
+        Returns:
+            List[JiraTicket]: List of JIRA tickets with all key-value pairs
+        """
+        try:
+            # await self.rate_limiter.acquire("jira", "search")
+            await self.rate_limiter.acquire("jira", "server_info")
+
+            client = self._get_client()
+
+            # Get all fields to find the custom field ID
+            fields = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: client.fields()
+            )
+            
+            logger.info(f"Looking for custom field: {custom_field_name}")
+            
+            # Find the custom field ID
+            custom_field_id = None
+            for field in fields:
+                if field["name"].lower() == custom_field_name.lower() and field.get(
+                    "custom", False
+                ):
+                    logger.info(f"Found custom field: {field['name']} (ID: {field['id']})")
+                    custom_field_id = field["id"]
+                    break
+
+            if not custom_field_id:
+                logger.error(f"Custom field '{custom_field_name}' not found!")
+                logger.info("Available custom fields:")
+                for field in fields:
+                    if field.get("custom", False):
+                        logger.info(f"  - {field['name']} (ID: {field['id']})")
+                return []
+
+            logger.info(f"Found custom field ID: {custom_field_id}")
+
+            # Build JQL query
+            jql_parts = [f'"{custom_field_name}" = "{custom_field_value}"']
+
+            if project_keys:
+                project_filter = " OR ".join(
+                    [f'project = "{key}"' for key in project_keys]
+                )
+                jql_parts.append(f"({project_filter})")
+
+            jql = " AND ".join(jql_parts)
+            logger.info(f"Searching JIRA tickets with JQL: {jql}")
+
+            # Execute search
+            issues = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: client.search_issues(jql, maxResults=1000, expand="changelog"),
+            )
+
+            # Convert to tickets
+            tickets = []
+            for issue in issues:
+                try:
+                    ticket = self._convert_jira_issue_to_ticket(issue)
+                    tickets.append(ticket)
+                except Exception as e:
+                    logger.warning(f"Failed to convert issue {issue.key}: {str(e)}")
+                    continue
+
+            logger.info(f"Found {len(tickets)} tickets for custom field {custom_field_name}={custom_field_value}")
+            return tickets
+
+        except JIRAError as e:
+            logger.error(f"JIRA search failed: {str(e)}")
+            if e.status_code == 429:
+                raise JiraRateLimitError()
+            elif e.status_code == 401:
+                raise JiraAuthenticationError("Authentication expired")
+            else:
+                raise CustomJiraError(f"Search failed: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error during JIRA search: {str(e)}")
+            raise CustomJiraError(f"Search failed: {str(e)}")
+ 

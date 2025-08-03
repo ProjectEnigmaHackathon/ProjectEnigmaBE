@@ -141,7 +141,7 @@ def _generate_pr_description(state: "WorkflowState", version: str) -> str:
 
 ## 🔄 Rollback Plan
 
-Rollback branches have been created from master for quick reversion if needed:
+Rollback branches have been created from main for quick reversion if needed:
 - Pattern: `rollback/v-{version.replace('v', '')}`
 
 ## ✅ Pre-deployment Checklist
@@ -458,8 +458,8 @@ def create_release_workflow() -> StateGraph:
 
             try:
                 # Get tickets by fix version
-                tickets = await jira_client.get_tickets_by_fix_version(
-                    state["fix_version"]
+                tickets = await jira_client.get_ticket_ids_by_custom_field(
+                    custom_field_name="Fix version", custom_field_value=state["fix_version"]
                 )
 
                 # Convert to simplified format for state storage
@@ -469,7 +469,7 @@ def create_release_workflow() -> StateGraph:
                         "summary": ticket.summary,
                         "status": ticket.status,
                         "assignee": ticket.assignee,
-                        "priority": ticket.priority,
+                        # "priority": ticket.priority,
                     }
                     for ticket in tickets
                 ]
@@ -508,21 +508,21 @@ def create_release_workflow() -> StateGraph:
                         "summary": "Implement user authentication",
                         "status": "Done",
                         "assignee": "developer1",
-                        "priority": "High",
+                        # "priority": "High",
                     },
                     {
                         "id": "PROJ-124",
                         "summary": "Fix data validation bug",
                         "status": "Done",
                         "assignee": "developer2",
-                        "priority": "Medium",
+                        # "priority": "Medium",
                     },
                     {
                         "id": "PROJ-125",
                         "summary": "Update API documentation",
                         "status": "In Progress",
                         "assignee": "developer3",
-                        "priority": "Low",
+                        # "priority": "Low",
                     },
                 ]
                 state["jira_tickets"] = jira_tickets
@@ -566,7 +566,7 @@ def create_release_workflow() -> StateGraph:
             github_client = clients.github
 
             jira_tickets = state.get("jira_tickets", [])
-            ticket_ids = [ticket["id"] for ticket in jira_tickets]
+            ticket_ids = [ticket["id"].lower() for ticket in jira_tickets]
 
             feature_branches = {}
             missing_branches = {}
@@ -656,17 +656,17 @@ def create_release_workflow() -> StateGraph:
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def validate_merge_status(state: WorkflowState) -> WorkflowState:
-        """Step 3: Validate merge status of feature branches."""
+        """Step 3: Validate and merge feature branches to sprint branch."""
         try:
             # Check if this step has already been completed
-            if check_step_completion(state, "merge_validation", "Step 3: Merge Status Validation"):
+            if check_step_completion(state, "merge_validation", "Step 3: Feature Branch Merge"):
                 return state
 
             state["current_step"] = "merge_validation"
 
             msg = AIMessage(
-                content="🔀 **Step 3: Merge Status Validation**\n"
-                f"Checking if feature branches are merged to {state['sprint_name']}...\n\n"
+                content="🔀 **Step 3: Feature Branch Merge**\n"
+                f"Checking and merging feature branches to {state['sprint_name']}...\n\n"
             )
             state["messages"] = add_messages(state["messages"], [msg])
 
@@ -678,31 +678,79 @@ def create_release_workflow() -> StateGraph:
             feature_branches = state.get("feature_branches", {})
             merge_status = {}
             unmerged_branches = {}
+            merge_results = {}
 
             for repo in state["repositories"]:
                 repo_branches = feature_branches.get(repo, [])
                 repo_merge_status = {}
                 repo_unmerged = []
+                repo_merge_results = {}
 
                 try:
                     for branch in repo_branches:
-                        # Check if branch is merged into sprint branch
-                        is_merged = await github_client.is_branch_merged(
+                        # Check if branch could be merged into sprint branch
+                        is_merged = await github_client.check_merge_status(
                             repo, branch, state["sprint_name"]
                         )
                         repo_merge_status[branch] = is_merged
 
-                        if not is_merged:
+                        if is_merged:
+                            # Actually perform the merge since it's possible
+                            try:
+                                merge_msg = AIMessage(
+                                    content=f"    🔀 Merging {branch} → {state['sprint_name']}...\n"
+                                )
+                                state["messages"] = add_messages(state["messages"], [merge_msg])
+                                
+                                merge_result = await github_client.merge_branches(
+                                    repo_name=repo,
+                                    source_branch=branch,
+                                    target_branch=state["sprint_name"]
+                                )
+                                
+                                repo_merge_results[branch] = {
+                                    "status": "success",
+                                    "merge_sha": merge_result.get("sha") if merge_result else None,
+                                }
+                                
+                                success_msg = AIMessage(
+                                    content=f"    ✅ {branch} → {state['sprint_name']} (merged successfully)\n"
+                                )
+                                state["messages"] = add_messages(state["messages"], [success_msg])
+                                await asyncio.sleep(0.3)  # Brief delay between merges
+                                
+                            except Exception as merge_error:
+                                # Handle merge conflicts or errors
+                                error_msg = str(merge_error)
+                                repo_merge_results[branch] = {
+                                    "status": "error",
+                                    "error": error_msg,
+                                }
+                                repo_unmerged.append(branch)
+                                
+                                if "conflict" in error_msg.lower() or "merge conflict" in error_msg.lower():
+                                    conflict_msg = AIMessage(
+                                        content=f"    ⚠️  {branch} → {state['sprint_name']} (merge conflict - manual resolution required)\n"
+                                    )
+                                else:
+                                    conflict_msg = AIMessage(
+                                        content=f"    ❌ {branch} → {state['sprint_name']} (merge failed: {error_msg})\n"
+                                    )
+                                state["messages"] = add_messages(state["messages"], [conflict_msg])
+                        else:
                             repo_unmerged.append(branch)
 
                     merge_status[repo] = repo_merge_status
                     unmerged_branches[repo] = repo_unmerged
+                    merge_results[repo] = repo_merge_results
 
-                    # Report status for this repository
+                    # Report final status for this repository
                     status_text = f"  📁 {repo}:\n"
                     for branch, is_merged in repo_merge_status.items():
-                        if is_merged:
-                            status_text += f"    ✅ {branch} → {state['sprint_name']}\n"
+                        if is_merged and branch not in repo_unmerged:
+                            status_text += f"    ✅ {branch} → {state['sprint_name']} (merged)\n"
+                        elif is_merged and branch in repo_unmerged:
+                            status_text += f"    ⚠️  {branch} → {state['sprint_name']} (merge failed)\n"
                         else:
                             status_text += f"    ⚠️  {branch} → needs merge to {state['sprint_name']}\n"
 
@@ -721,20 +769,28 @@ def create_release_workflow() -> StateGraph:
                     # Mock merge status - assume first branches are merged, others are not
                     mock_merge_status = {}
                     mock_unmerged = []
+                    mock_merge_results = {}
 
                     for i, branch in enumerate(repo_branches):
                         is_merged = i < len(repo_branches) // 2  # First half merged
                         mock_merge_status[branch] = is_merged
-                        if not is_merged:
+                        if is_merged:
+                            # Simulate successful merge
+                            mock_merge_results[branch] = {
+                                "status": "success",
+                                "merge_sha": f"mock_sha_{branch}_{repo}",
+                            }
+                        else:
                             mock_unmerged.append(branch)
 
                     merge_status[repo] = mock_merge_status
                     unmerged_branches[repo] = mock_unmerged
+                    merge_results[repo] = mock_merge_results
 
                     mock_status = f"  📁 {repo} (mock):\n"
                     for branch, is_merged in mock_merge_status.items():
                         if is_merged:
-                            mock_status += f"    ✅ {branch} → {state['sprint_name']}\n"
+                            mock_status += f"    ✅ {branch} → {state['sprint_name']} (merged)\n"
                         else:
                             mock_status += f"    ⚠️  {branch} → needs merge\n"
 
@@ -743,6 +799,7 @@ def create_release_workflow() -> StateGraph:
 
             state["merge_status"] = merge_status
             state["unmerged_branches"] = unmerged_branches
+            state["merge_results"] = merge_results
 
             # Summary
             total_branches = sum(
@@ -752,17 +809,28 @@ def create_release_workflow() -> StateGraph:
                 len(unmerged) for unmerged in unmerged_branches.values()
             )
             total_merged = total_branches - total_unmerged
+            
+            # Count successful merges
+            total_merge_attempts = sum(
+                len(results) for results in merge_results.values()
+            )
+            total_successful_merges = sum(
+                len([r for r in results.values() if r.get("status") == "success"])
+                for results in merge_results.values()
+            )
+            total_failed_merges = total_merge_attempts - total_successful_merges
 
             summary_msg = AIMessage(
                 content=f"\n📊 **Merge Status Summary:**\n"
                 f"• Total branches checked: {total_branches}\n"
-                f"• Merged to {state['sprint_name']}: {total_merged}\n"
-                f"• Require merging: {total_unmerged}\n\n"
+                f"• Successfully merged to {state['sprint_name']}: {total_successful_merges}\n"
+                f"• Failed merges: {total_failed_merges}\n"
+                f"• Require manual merging: {total_unmerged}\n\n"
             )
 
-            if total_unmerged > 0:
+            if total_unmerged > 0 or total_failed_merges > 0:
                 summary_msg.content += (
-                    "⚠️  **Action Required:** Some branches need to be merged to the sprint branch "
+                    "⚠️  **Action Required:** Some branches still need attention "
                     "before proceeding with the release.\n\n"
                 )
 
@@ -833,22 +901,22 @@ def create_release_workflow() -> StateGraph:
                         #     merge_method="merge",  # Can be 'merge', 'squash', or 'rebase'
                         # )
                         merge_result = await github_client.merge_branches(
-                            repo=repo,
-                            repo_name=state["sprint_name"],
+                            repo_name=repo,
+                            source_branch=state["sprint_name"],
                             target_branch="develop",
                         )
 
                         sprint_merge_results[repo] = {
                             "status": "success",
-                            "pr_url": pr.html_url,
+                            "pr_url": pr.url,
                             "pr_number": pr.number,
-                            "merge_sha": merge_result.sha if merge_result else None,
+                            "merge_sha": merge_result.get("sha") if merge_result else None,
                         }
                         successful_merges.append(repo)
 
                         success_msg = AIMessage(
                             content=f"  📁 {repo}: ✅ Merged successfully\n"
-                            f"    📝 PR: {pr.html_url}\n"
+                            f"    📝 PR: {pr.url}\n"
                         )
                         state["messages"] = add_messages(
                             state["messages"], [success_msg]
@@ -863,7 +931,7 @@ def create_release_workflow() -> StateGraph:
                         ):
                             sprint_merge_results[repo] = {
                                 "status": "conflict",
-                                "pr_url": pr.html_url,
+                                "pr_url": pr.url,
                                 "pr_number": pr.number,
                                 "error": conflict_msg,
                             }
@@ -871,7 +939,7 @@ def create_release_workflow() -> StateGraph:
 
                             conflict_msg_obj = AIMessage(
                                 content=f"  📁 {repo}: ⚠️  Merge conflict detected\n"
-                                f"    📝 PR: {pr.html_url}\n"
+                                f"    📝 PR: {pr.url}\n"
                                 f"    🔧 Manual resolution required\n"
                             )
                             state["messages"] = add_messages(
@@ -881,14 +949,14 @@ def create_release_workflow() -> StateGraph:
                             # Other merge error
                             sprint_merge_results[repo] = {
                                 "status": "error",
-                                "pr_url": pr.html_url,
+                                "pr_url": pr.url,
                                 "pr_number": pr.number,
                                 "error": conflict_msg,
                             }
 
                             error_msg = AIMessage(
                                 content=f"  📁 {repo}: ❌ Merge failed\n"
-                                f"    📝 PR: {pr.html_url}\n"
+                                f"    📝 PR: {pr.url}\n"
                                 f"    🔧 Error: {conflict_msg}\n"
                             )
                             state["messages"] = add_messages(
@@ -1012,7 +1080,7 @@ def create_release_workflow() -> StateGraph:
                     else:
                         # Create new release branch
                         new_branch = await github_client.create_branch(
-                            repo=repo, branch_name=branch_name, source_branch="develop"
+                            repo_name=repo, branch_name=branch_name, source_branch="develop"
                         )
 
                         version_info[repo] = {
@@ -1085,7 +1153,7 @@ def create_release_workflow() -> StateGraph:
 
     @log_workflow_function(level=LogLevel.INFO, include_state=True, include_result=False, include_execution_time=True, log_errors=True)
     async def generate_pull_requests(state: WorkflowState) -> WorkflowState:
-        """Step 7: Generate pull requests from release branches to master."""
+        """Step 7: Generate pull requests from release branches to main."""
         try:
             # Check if this step has already been completed
             if check_step_completion(state, "pr_generation", "Step 7: Generating Pull Requests"):
@@ -1095,7 +1163,7 @@ def create_release_workflow() -> StateGraph:
 
             msg = AIMessage(
                 content=f"\n📝 **Step 7: Generating Pull Requests**\n"
-                "Creating PRs from release branches to master...\n"
+                "Creating PRs from release branches to main...\n"
             )
             state["messages"] = add_messages(state["messages"], [msg])
 
@@ -1118,22 +1186,22 @@ def create_release_workflow() -> StateGraph:
                     pr_title = f"Release {calculated_version}"
                     pr_description = _generate_pr_description(state, calculated_version)
 
-                    # Create pull request from release branch to master
+                    # Create pull request from release branch to main
                     pr = await github_client.create_pull_request(
-                        repo=repo,
+                        repo_name=repo,
                         title=pr_title,
-                        head=release_branch,
-                        base="master",  # or "main" depending on repository default
+                        head_branch=release_branch,
+                        base_branch="main",  # or "main" depending on repository default
                         body=pr_description,
                     )
 
                     pr_info = {
                         "repo": repo,
-                        "url": pr.html_url,
+                        "url": pr.url,
                         "number": pr.number,
                         "title": pr_title,
                         "head": release_branch,
-                        "base": "master",
+                        "base": "main",
                         "status": "created",
                     }
 
@@ -1142,8 +1210,8 @@ def create_release_workflow() -> StateGraph:
 
                     success_msg = AIMessage(
                         content=f"  📁 {repo}: ✅ PR created\n"
-                        f"    📝 {pr.html_url}\n"
-                        f"    🔀 {release_branch} → master\n"
+                        f"    📝 {pr.url}\n"
+                        f"    🔀 {release_branch} → main\n"
                     )
                     state["messages"] = add_messages(state["messages"], [success_msg])
 
@@ -1163,7 +1231,7 @@ def create_release_workflow() -> StateGraph:
                         "number": mock_pr_number,
                         "title": f"Release {calculated_version}",
                         "head": f"release/{calculated_version}",
-                        "base": "master",
+                        "base": "main",
                         "status": "mock",
                     }
 
@@ -1251,11 +1319,11 @@ def create_release_workflow() -> StateGraph:
 
                     # Create Git tag on the release branch
                     tag = await github_client.create_tag(
-                        repo=repo,
+                        repo_name=repo,
                         tag_name=tag_name,
-                        target_sha=None,  # Will use latest commit on release branch
+                        sha=None,  # Will use latest commit on release branch
                         message=tag_message,
-                        target_ref=release_branch,
+                        # target_ref=release_branch,
                     )
 
                     tag_info = {
@@ -1360,7 +1428,7 @@ def create_release_workflow() -> StateGraph:
 
             msg = AIMessage(
                 content=f"\n🔄 **Step 9: Preparing Rollback Branches**\n"
-                f"Creating rollback branches from master for version {calculated_version}...\n"
+                f"Creating rollback branches from main for version {calculated_version}...\n"
             )
             state["messages"] = add_messages(state["messages"], [msg])
 
@@ -1388,7 +1456,7 @@ def create_release_workflow() -> StateGraph:
                         rollback_creation_results[repo] = {
                             "status": "exists",
                             "branch": rollback_branch,
-                            "base": "master",
+                            "base": "main",
                         }
 
                         exists_msg = AIMessage(
@@ -1398,22 +1466,22 @@ def create_release_workflow() -> StateGraph:
                             state["messages"], [exists_msg]
                         )
                     else:
-                        # Create new rollback branch from master HEAD
+                        # Create new rollback branch from main HEAD
                         new_branch = await github_client.create_branch(
-                            repo=repo,
+                            repo_name=repo,
                             branch_name=rollback_branch,
-                            source_branch="master",  # or "main" depending on repository default
+                            source_branch="main",  # or "main" depending on repository default
                         )
 
                         rollback_creation_results[repo] = {
                             "status": "created",
                             "branch": rollback_branch,
-                            "base": "master",
+                            "base": "main",
                             "sha": new_branch.sha,
                         }
 
                         success_msg = AIMessage(
-                            content=f"  📁 {repo}: ✅ {rollback_branch} created from master\n"
+                            content=f"  📁 {repo}: ✅ {rollback_branch} created from main\n"
                             f"    🔗 SHA: {new_branch.sha[:8]}\n"
                         )
                         state["messages"] = add_messages(
@@ -1437,7 +1505,7 @@ def create_release_workflow() -> StateGraph:
                     rollback_creation_results[repo] = {
                         "status": "created",
                         "branch": rollback_branch,
-                        "base": "master",
+                        "base": "main",
                         "sha": "mock_rollback_sha",
                     }
                     rollback_branches.append(f"{repo}:{rollback_branch}")
@@ -1473,7 +1541,7 @@ def create_release_workflow() -> StateGraph:
                 f"• Total repositories: {len(state['repositories'])}\n\n"
                 "🛡️ **Rollback Instructions:**\n"
                 "1. In case of deployment issues, checkout rollback branch\n"
-                "2. Create emergency PR from rollback branch to master\n"
+                "2. Create emergency PR from rollback branch to main\n"
                 "3. Deploy rollback branch to restore previous state\n"
                 f"4. Branch naming pattern: `rollback/v-{calculated_version.replace('v', '')}`\n\n"
                 "🚨 **Emergency Rollback Command:**\n"
@@ -1563,15 +1631,15 @@ def create_release_workflow() -> StateGraph:
                     break
 
             # Jenkins URL (standardized format)
-            jenkins_url = f"https://jenkins.your-company.com/job/{repo}/job/{repo_release_branch or 'master'}/build"
+            jenkins_url = f"https://jenkins.your-company.com/job/{repo}/job/{repo_release_branch or 'main'}/build"
 
             deployment_sections.append(
                 f"""
                 <h4>{repo}</h4>
                 <ul>
-                    <li><strong>Jenkins Job:</strong> <a href="{jenkins_url}">{repo} - {repo_release_branch or 'master'}</a></li>
+                    <li><strong>Jenkins Job:</strong> <a href="{jenkins_url}">{repo} - {repo_release_branch or 'main'}</a></li>
                     <li><strong>Pull Request:</strong> {f'<a href="{repo_pr.get("url", "#")}">{repo_pr.get("title", "PR")}</a>' if repo_pr else 'N/A'}</li>
-                    <li><strong>Branch:</strong> {repo_release_branch or 'master'}</li>
+                    <li><strong>Branch:</strong> {repo_release_branch or 'main'}</li>
                     <li><strong>Version:</strong> {calculated_version}</li>
                 </ul>
             """
@@ -1582,7 +1650,7 @@ def create_release_workflow() -> StateGraph:
                 <h4>{repo}</h4>
                 <ul>
                     <li><strong>Rollback Branch:</strong> {repo_rollback_branch or f'rollback/v-{calculated_version.replace("v", "")}'}</li>
-                    <li><strong>Emergency Jenkins Job:</strong> <a href="https://jenkins.your-company.com/job/{repo}/job/{repo_rollback_branch or 'master'}/build">{repo} - Rollback</a></li>
+                    <li><strong>Emergency Jenkins Job:</strong> <a href="https://jenkins.your-company.com/job/{repo}/job/{repo_rollback_branch or 'main'}/build">{repo} - Rollback</a></li>
                     <li><strong>Rollback Command:</strong> <code>git checkout {repo_rollback_branch or f'rollback/v-{calculated_version.replace("v", "")}'}</code></li>
                 </ul>
             """
