@@ -91,7 +91,14 @@ def create_app() -> FastAPI:
     # Configure CORS
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["https://project-enigma-fe.s3.ap-south-1.amazonaws.com"],
+        allow_origins=[
+            "https://project-enigma-fe.s3.ap-south-1.amazonaws.com",
+            "https://project-enigma-fe.s3-website.ap-south-1.amazonaws.com",
+            "https://project-enigma-fe.s3-website-ap-south-1.amazonaws.com",
+            # Local development
+            "http://localhost:3000",
+            "http://localhost:5173",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
