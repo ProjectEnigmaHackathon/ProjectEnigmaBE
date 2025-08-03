@@ -1317,11 +1317,19 @@ def create_release_workflow() -> StateGraph:
                     # Generate tag message with release information
                     tag_message = _generate_tag_message(state, calculated_version)
 
+                    # Get SHA of the release branch
+                    branches = await github_client.get_branches(repo)
+                    release_branch_sha = None
+                    for branch in branches:
+                        if branch.name == release_branch:
+                            release_branch_sha = branch.sha
+                            break
+                    
                     # Create Git tag on the release branch
                     tag = await github_client.create_tag(
                         repo_name=repo,
                         tag_name=tag_name,
-                        sha=None,  # Will use latest commit on release branch
+                        sha=release_branch_sha,
                         message=tag_message,
                         # target_ref=release_branch,
                     )
@@ -1347,10 +1355,16 @@ def create_release_workflow() -> StateGraph:
 
                 except Exception as api_error:
                     # Handle tag creation error
-                    error_msg = AIMessage(
-                        content=f"  ⚠️  GitHub API error for {repo}: {str(api_error)}\n"
-                        f"  🔧 Simulating tag creation for {repo}...\n"
-                    )
+                    error_str = str(api_error)
+                    if "Reference already exists" in error_str or "422" in error_str:
+                        error_msg = AIMessage(
+                            content=f"  📁 {repo}: Tag {tag_name} already exists\n"
+                        )
+                    else:
+                        error_msg = AIMessage(
+                            content=f"  ⚠️  GitHub API error for {repo}: {error_str}\n"
+                            f"  🔧 Simulating tag creation for {repo}...\n"
+                        )
                     state["messages"] = add_messages(state["messages"], [error_msg])
 
                     # Mock tag creation
